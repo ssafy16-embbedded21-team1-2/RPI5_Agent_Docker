@@ -1,0 +1,4 @@
+{
+  "scenario": "bms_timeout",
+  "use_llm": true
+}

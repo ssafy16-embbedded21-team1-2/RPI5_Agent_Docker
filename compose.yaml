@@ -1,0 +1,35 @@
+name: rpi5-agent
+
+services:
+  agent:
+    image: rpi5-agent:local
+    build:
+      context: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${AGENT_BIND:-127.0.0.1}:${AGENT_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      LLM_ENABLED: ${LLM_ENABLED:-false}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8080/v1}
+      LLM_MODEL: ${LLM_MODEL:-local-qwen}
+      LLM_API_KEY: ${LLM_API_KEY:-not-required}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-120}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-256}
+      LANGSMITH_TRACING: "false"
+    mem_limit: ${AGENT_MEMORY_LIMIT:-768m}
+    cpus: ${AGENT_CPU_LIMIT:-1.0}
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

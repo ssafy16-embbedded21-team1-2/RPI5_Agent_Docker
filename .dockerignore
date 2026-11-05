@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+.venv
+**/__pycache__
+.pytest_cache
+.ruff_cache
+tests
+docs
+data
+models
+**/*.gguf
+**/*.log
+dist
+build
