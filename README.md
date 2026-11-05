@@ -135,6 +135,8 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 
 이 단계는 **모델의 설명 생성만** 사용하며 native tool calling에 의존하지 않습니다.
 모델은 도구 선택이나 하드웨어 명령을 실행하지 않습니다.
+모델 서버가 Chat Completions의 `response_format` / JSON Schema 기반 출력을 지원해야 합니다.
+미지원 서버의 오류는 `llm_status=unavailable`로 반환하며 자유 형식으로 재요청하지 않습니다.
 기존 2048 토큰 컨텍스트를 고려해 짧은 증거와 최대 256 토큰의 출력을 기본으로 사용합니다.
 설정을 늘리기 전 실제 모델의 토큰 사용량과 메모리를 측정합니다.
 
@@ -146,8 +148,8 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 | `healthy` | 게이트웨이와 BMS 데이터가 모두 최신인 예제 |
 | `bms_timeout` | 게이트웨이는 최신이고 BMS 원본만 오래된 예제 |
 | `bus_off` | RPi 로컬 어댑터 Bus-Off와 원격 상태 미확인을 구분 |
-| LLM 설명 | 선택적으로 LangChain `ChatOpenAI`로 호환 Chat Completions API 호출 |
-| 모델 오류 | 규칙 판정 결과를 유지하고 `llm_status=unavailable`과 오류 종류 반환 |
+| LLM 설명 | JSON Schema로 원인 후보와 추가 확인을 받아 Pydantic으로 검증 |
+| 모델 오류 | 연결 실패·출력 잘림·형식 오류 시 코드 기반 요약 유지 |
 | 실제 CAN·UDS·SWD | 미구현. 현재 가상 데이터만 사용 |
 | 승인·제어·복구 | 미구현. 제어 API와 임의 명령 실행 경로 없음 |
 | 이력·RAG·대화 | 미구현. 요청별 처리이며 결과는 응답으로 반환 |
@@ -161,6 +163,40 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 동시에 진단을 여러 번 요청하면 진행 중인 요청 외에는 HTTP 429를 반환합니다.
 모델 호출은 자동 재시도하지 않으며 기본 제한 시간은 120초입니다.
 모델 실패는 HTTP 200 응답 안의 `llm_status=unavailable`로 구분하므로 호출자가 이 필드를 확인해야 합니다.
+
+### 설명 출력과 종료 사유
+
+관측 문장은 코드의 `findings`에서 조립합니다. 모델은 `hypothesis`와 `next_check` 두 필드만 작성하며,
+각 필드는 공백 정리 후 1~50자의 단일 행 문자열이어야 합니다. 추가 필드·빈 값·잘못된 타입은 거절합니다.
+한국어 한 문장씩 작성하도록 프롬프트에서 지시합니다.
+정상 종료(`finish_reason=stop`)와 형식 검증을 모두 통과한 경우에만 `generated`로 처리합니다.
+이는 진단 정확성이나 원인 확정을 의미하지 않습니다.
+
+표시 형식 예시:
+
+```text
+[가상 데이터]
+관측: 게이트웨이 집계 데이터는 최근에 갱신되었습니다. BMS 원본 데이터의 갱신이 지연되었습니다. 게이트웨이 생존과 구분합니다.
+원인 후보: BMS 송신 또는 중계 경로에 문제가 있을 수 있습니다.
+추가 확인: BMS 송신 기록과 게이트웨이 수신 기록을 비교하세요.
+```
+
+API에는 기존 `summary`와 함께 구조화된 `explanation` 및 `llm_metadata`를 제공합니다.
+`llm_metadata`의 `finish_reason`, `input_tokens`, `output_tokens`는 서버가 제공한 값이며,
+제공되지 않은 토큰 수는 `null`입니다.
+
+| 상황 | `llm_status` | `llm_error` | 설명 표시 |
+| --- | --- | --- | --- |
+| 정상 종료와 형식 검증 통과 | `generated` | `null` | 관측 + 모델의 두 필드 |
+| 출력 토큰 한도 도달 | `unavailable` | `output_truncated` | 코드 기반 관측만 |
+| JSON·필드·길이 검증 실패 | `unavailable` | `invalid_model_output` | 코드 기반 관측만 |
+| 종료 사유 누락 또는 비정상 종료 | `unavailable` | `unexpected_finish_reason` | 코드 기반 관측만 |
+| 연결·서버 오류 | `unavailable` | 오류 종류 | 코드 기반 관측만 |
+| 모델 미사용 | `disabled` | `null` | 코드 기반 관측만 |
+
+실패한 모델 설명은 `explanation=null`로 반환합니다.
+유효한 JSON이라도 종료 사유가 `length`이면 잘린 출력으로 처리합니다.
+출력 글자 수 제한과 토큰 수 제한은 서로 다르므로 토큰 상한은 256으로 유지했습니다.
 
 ## 6. 개발과 테스트
 
@@ -182,7 +218,8 @@ uv run --frozen uvicorn rpi5_agent.api:app --host 127.0.0.1 --port 8000
 `http://127.0.0.1:8080/v1`로 변경합니다. 기본 `.env.example`의 주소는 Docker용입니다.
 
 테스트는 가상 시나리오 판정, 입력 검증, 모델 오류 시 증거 유지, 동시 요청 제한,
-로컬 HTTP 모형 서버를 통한 실제 LangChain API 호출을 검증합니다.
+로컬 HTTP 모형 서버를 통한 실제 LangChain API 호출과 구조화 출력을 검증합니다.
+출력 잘림, 비정상 종료, JSON 오류, 초과 길이·추가 필드·줄바꿈 등도 검사합니다.
 테스트 통과만으로 실제 Qwen 추론이나 RPi·STM32 연결이 검증되는 것은 아닙니다.
 
 ```text
@@ -190,6 +227,7 @@ src/rpi5_agent/
 ├── api.py              HTTP 진입점과 동시 요청 제한
 ├── config.py           환경변수와 로컬 모델 설정
 ├── models.py           입력·증거·진단 결과 형식
+├── errors.py           사용 불가능한 모델 응답의 오류 코드와 메타데이터
 ├── workflow.py         LangGraph 흐름과 규칙 판정
 ├── llm.py              LangChain 모델 설명 생성
 └── tools/fixtures.py   가상 증거 공급자

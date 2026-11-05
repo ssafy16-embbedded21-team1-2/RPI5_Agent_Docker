@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from rpi5_agent.api import create_app
 from rpi5_agent.config import Settings
-from rpi5_agent.models import Scenario
+from rpi5_agent.models import LLMMetadata, ModelExplanation, Scenario, SummaryResult
 from rpi5_agent.tools.fixtures import collect_fixture
 from rpi5_agent.workflow import evaluate
 
@@ -86,7 +86,13 @@ def test_busy_agent_rejects_concurrent_diagnoses_and_recovers():
             entered.set()
             if not release.wait(5):
                 raise TimeoutError("test release not received")
-            return "가상 데이터의 BMS 갱신이 지연되었습니다."
+            return SummaryResult(
+                explanation=ModelExplanation(
+                    hypothesis="BMS 송신 지연 가능성이 있습니다.",
+                    next_check="BMS 송신 기록을 확인하세요.",
+                ),
+                metadata=LLMMetadata(finish_reason="stop"),
+            )
 
     with TestClient(create_app(config(llm_enabled=True), SlowModel())) as client:
         with ThreadPoolExecutor(max_workers=1) as executor:

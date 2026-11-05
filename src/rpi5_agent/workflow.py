@@ -4,14 +4,15 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
-from rpi5_agent.models import DiagnoseRequest, Diagnosis, Finding, ToolResult
+from rpi5_agent.errors import SummaryError
+from rpi5_agent.models import DiagnoseRequest, Diagnosis, Finding, SummaryResult, ToolResult
 from rpi5_agent.tools.fixtures import collect_fixture
 
 logger = logging.getLogger(__name__)
 
 
 class Summarizer(Protocol):
-    def summarize(self, evidence: list[ToolResult], findings: list[Finding]) -> str: ...
+    def summarize(self, evidence: list[ToolResult], findings: list[Finding]) -> SummaryResult: ...
 
 
 class DiagnosticState(TypedDict, total=False):
@@ -102,21 +103,29 @@ def build_workflow(summarizer: Summarizer | None = None):
             scenario=state["request"].scenario,
             evidence=state["evidence"],
             findings=state["findings"],
-            summary="[가상 데이터] " + " ".join(item.message for item in state["findings"]),
+            summary="[가상 데이터]\n관측: " + " ".join(item.message for item in state["findings"]),
         )
         if state["request"].use_llm:
             if summarizer is None:
                 raise RuntimeError("LLM was requested but no summarizer is configured")
             try:
-                result.summary = "[가상 데이터 / 모델 설명] " + summarizer.summarize(
-                    state["evidence"], state["findings"]
+                model_result = summarizer.summarize(state["evidence"], state["findings"])
+                result.explanation = model_result.explanation
+                result.llm_metadata = model_result.metadata
+                result.summary += (
+                    f"\n원인 후보: {model_result.explanation.hypothesis}"
+                    f"\n추가 확인: {model_result.explanation.next_check}"
                 )
                 result.llm_status = "generated"
             except Exception as exc:
                 # Keep deterministic findings available; do not report model failure as success.
                 result.llm_status = "unavailable"
-                result.llm_error = type(exc).__name__
-                logger.warning("LLM summary unavailable: %s", type(exc).__name__)
+                if isinstance(exc, SummaryError):
+                    result.llm_error = exc.code
+                    result.llm_metadata = exc.metadata
+                else:
+                    result.llm_error = type(exc).__name__
+                logger.warning("LLM summary unavailable: %s", result.llm_error)
         return {"result": result}
 
     graph = StateGraph(DiagnosticState)

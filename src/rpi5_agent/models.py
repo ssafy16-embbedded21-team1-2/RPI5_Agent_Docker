@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Scenario(StrEnum):
@@ -34,6 +34,31 @@ class Finding(BaseModel):
     message: str
 
 
+class ModelExplanation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+
+    hypothesis: str = Field(min_length=1, max_length=50)
+    next_check: str = Field(min_length=1, max_length=50)
+
+    @field_validator("hypothesis", "next_check")
+    @classmethod
+    def single_line(cls, value: str) -> str:
+        if len(value.splitlines()) != 1 or any(ord(char) < 32 for char in value):
+            raise ValueError("Explanation fields must be single-line text")
+        return value
+
+
+class LLMMetadata(BaseModel):
+    finish_reason: str | None = None
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+
+
+class SummaryResult(BaseModel):
+    explanation: ModelExplanation
+    metadata: LLMMetadata
+
+
 class Diagnosis(BaseModel):
     request_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -44,3 +69,5 @@ class Diagnosis(BaseModel):
     summary: str
     llm_status: Literal["disabled", "generated", "unavailable"] = "disabled"
     llm_error: str | None = None
+    explanation: ModelExplanation | None = None
+    llm_metadata: LLMMetadata | None = None
