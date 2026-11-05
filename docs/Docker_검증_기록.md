@@ -4,14 +4,14 @@
 
 ## 실행 환경
 
-| 항목 | 확인값 |
-| --- | --- |
-| 호스트 | Windows, Docker Desktop Linux 엔진 / WSL2 |
-| Docker Desktop | 4.98.0 |
-| Docker Engine | 29.9.2 |
-| PC 컨테이너 | Linux AMD64, Python 3.12.16 |
-| 기본 이미지 | `rpi5-agent:local` |
-| ARM64 검사 이미지 | `rpi5-agent:arm64-check` |
+| 항목              | 확인값                                    |
+| ----------------- | ----------------------------------------- |
+| 호스트            | Windows, Docker Desktop Linux 엔진 / WSL2 |
+| Docker Desktop    | 4.98.0                                    |
+| Docker Engine     | 29.9.2                                    |
+| PC 컨테이너       | Linux AMD64, Python 3.12.16               |
+| 기본 이미지       | `rpi5-agent:local`                        |
+| ARM64 검사 이미지 | `rpi5-agent:arm64-check`                  |
 
 ## PC 컨테이너 검증
 
@@ -75,6 +75,6 @@ AMD64 이미지의 Docker 보고 크기는 287,865,543바이트였습니다.
 
 ## 별도 검증이 필요한 항목
 
-- RPi 5 실기기의 성능, 메모리와 장시간 동작
-- 실제 Qwen 모델 연결, 한국어 진단 설명의 정확성 및 응답 시간
+- RPi 5와 실제 Qwen의 단기 연결·실행 결과는 [RPi 5 검증 기록](RPi5_검증_기록.md)에 추가함
+- 장시간 동작, 한국어 진단 설명의 정확성과 다양한 입력의 응답 시간
 - 실제 CAN·UDS·SWD와 STM32 연결: 현재 코드에는 가상 데이터 공급자만 구현됨

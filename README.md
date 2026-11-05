@@ -7,7 +7,8 @@ LangChain이 호스트의 `llama-server`에 설명 생성을 요청합니다.
 **현재 모든 진단 입력은 가상 데이터입니다.** CAN·UDS·SWD의 실제 수집과 제어는 아직 구현하지 않았습니다.
 트랜시버와 모델 없이도 API와 진단 흐름을 실행할 수 있습니다.
 
-PC Docker에서 확인한 결과와 검증 범위는 [Docker 검증 기록](docs/Docker_검증_기록.md)을 참고하세요.
+PC Docker에서 확인한 결과는 [Docker 검증 기록](docs/Docker_검증_기록.md),
+RPi 5와 실제 Qwen 연결 결과는 [RPi 5 검증 기록](docs/RPi5_검증_기록.md)을 참고하세요.
 
 ## 1. 실행 구성
 
