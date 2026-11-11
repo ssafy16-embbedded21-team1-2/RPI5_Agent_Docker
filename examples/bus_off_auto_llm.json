@@ -1,0 +1,5 @@
+{
+  "scenario": "bus_off",
+  "use_llm": true,
+  "llm_target": "auto"
+}

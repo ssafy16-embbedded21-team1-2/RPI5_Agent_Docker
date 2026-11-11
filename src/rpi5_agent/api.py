@@ -4,8 +4,8 @@ from threading import BoundedSemaphore
 from fastapi import FastAPI, HTTPException
 
 from rpi5_agent.config import Settings
-from rpi5_agent.llm import LocalSummarizer
-from rpi5_agent.models import DiagnoseRequest, Diagnosis, Scenario
+from rpi5_agent.llm import RoutedSummarizer
+from rpi5_agent.models import DiagnoseRequest, Diagnosis, LLMTarget, Scenario
 from rpi5_agent.workflow import Summarizer, build_workflow
 
 
@@ -15,7 +15,7 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         config = settings if settings is not None else Settings()
         model = summarizer
         if config.llm_enabled and model is None:
-            model = LocalSummarizer(config)
+            model = RoutedSummarizer(config)
         app.state.settings = config
         app.state.workflow = build_workflow(model)
         app.state.diagnosis_slot = BoundedSemaphore(1)
@@ -38,6 +38,8 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
             raise HTTPException(
                 status_code=409, detail="Set LLM_ENABLED=true to request a model summary"
             )
+        if request.llm_target == LLMTarget.EXTERNAL and not app.state.settings.external_llm_enabled:
+            raise HTTPException(status_code=409, detail="Set EXTERNAL_LLM_ENABLED=true first")
         # One diagnostic run at a time; do not queue unbounded model requests on the Pi.
         if not app.state.diagnosis_slot.acquire(blocking=False):
             raise HTTPException(status_code=429, detail="A diagnosis is already running")

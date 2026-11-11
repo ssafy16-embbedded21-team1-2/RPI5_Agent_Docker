@@ -66,7 +66,7 @@ def test_unknown_scenario_and_control_fields_are_rejected():
 
 def test_llm_failure_preserves_findings_and_does_not_leak_exception_details():
     class BrokenModel:
-        def summarize(self, evidence, findings):
+        def summarize(self, evidence, findings, *, target="auto"):
             raise TimeoutError("sensitive-key-not-for-response")
 
     with TestClient(create_app(config(llm_enabled=True), BrokenModel())) as client:
@@ -82,7 +82,7 @@ def test_busy_agent_rejects_concurrent_diagnoses_and_recovers():
     entered, release = Event(), Event()
 
     class SlowModel:
-        def summarize(self, evidence, findings):
+        def summarize(self, evidence, findings, *, target="auto"):
             entered.set()
             if not release.wait(5):
                 raise TimeoutError("test release not received")

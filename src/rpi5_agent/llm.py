@@ -7,18 +7,36 @@ from pydantic import ValidationError
 
 from rpi5_agent.config import Settings
 from rpi5_agent.errors import SummaryError
-from rpi5_agent.models import Finding, LLMMetadata, ModelExplanation, SummaryResult, ToolResult
+from rpi5_agent.models import (
+    Finding,
+    LLMAttempt,
+    LLMMetadata,
+    LLMRouting,
+    LLMTarget,
+    ModelExplanation,
+    SummaryResult,
+    ToolResult,
+)
 
 
-class LocalSummarizer:
-    def __init__(self, settings: Settings):
+class ChatSummarizer:
+    """One configured backend, with the same strict output validation for both providers."""
+
+    def __init__(self, settings: Settings, *, external: bool = False):
+        self.model_id = settings.external_llm_model if external else settings.llm_model
+        self.response_format = settings.external_llm_response_format if external else "json_schema"
         self.model = ChatOpenAI(
-            model=settings.llm_model,
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key,
+            model=self.model_id,
+            base_url=settings.external_llm_base_url if external else settings.llm_base_url,
+            api_key=settings.external_llm_api_key if external else settings.llm_api_key,
+            default_headers=(
+                {"User-Agent": settings.external_llm_user_agent} if external else None
+            ),
             temperature=0.2,
-            max_tokens=settings.llm_max_tokens,
-            timeout=settings.llm_timeout_seconds,
+            max_tokens=(settings.external_llm_max_tokens if external else settings.llm_max_tokens),
+            timeout=(
+                settings.external_llm_timeout_seconds if external else settings.llm_timeout_seconds
+            ),
             max_retries=0,
             use_responses_api=False,
         )
@@ -49,7 +67,8 @@ class LocalSummarizer:
             ),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
         ]
-        # Request schema-constrained JSON directly, without a tool-calling round trip.
+        # Pamout documents chat completions, but does not promise JSON Schema support.
+        # Prompt-only is a configured provider mode, never a silent retry after schema failure.
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -58,8 +77,13 @@ class LocalSummarizer:
                 "schema": ModelExplanation.model_json_schema(),
             },
         }
+        invoke_options = {}
+        if self.response_format == "json_schema":
+            invoke_options["response_format"] = response_format
+        elif self.response_format == "json_object":
+            invoke_options["response_format"] = {"type": "json_object"}
         try:
-            response = self.model.invoke(messages, response_format=response_format)
+            response = self.model.invoke(messages, **invoke_options)
         except (LengthFinishReasonError, ContentFilterFinishReasonError) as exc:
             # The SDK may reject these before LangChain returns an AIMessage.
             completion_usage = exc.completion.usage if exc.completion is not None else None
@@ -90,3 +114,78 @@ class LocalSummarizer:
         except ValidationError as exc:
             raise SummaryError("invalid_model_output", metadata) from exc
         return SummaryResult(explanation=explanation, metadata=metadata)
+
+
+class RoutedSummarizer:
+    """Deterministic request routing, with at most one call per selected backend."""
+
+    def __init__(self, settings: Settings):
+        self.local = ChatSummarizer(settings)
+        self.external = (
+            ChatSummarizer(settings, external=True) if settings.external_llm_enabled else None
+        )
+        self.fallback_on_failure = settings.external_llm_fallback_on_local_failure
+
+    def summarize(
+        self,
+        evidence: list[ToolResult],
+        findings: list[Finding],
+        *,
+        target: LLMTarget = LLMTarget.AUTO,
+    ) -> SummaryResult:
+        if target == LLMTarget.EXTERNAL:
+            if self.external is None:
+                raise SummaryError("external_llm_disabled")
+            candidates = [("pamout", self.external)]
+            reason = "explicit_external"
+        elif target == LLMTarget.LOCAL:
+            candidates = [("local", self.local)]
+            reason = "explicit_local"
+        elif self.external is not None and any(item.severity == "error" for item in findings):
+            candidates = [("pamout", self.external)]
+            reason = "error_findings"
+        else:
+            candidates = [("local", self.local)]
+            reason = "local_default"
+            if self.external is not None and self.fallback_on_failure:
+                candidates.append(("pamout", self.external))
+
+        route = LLMRouting(
+            requested=target,
+            backend=candidates[0][0],
+            model=candidates[0][1].model_id,
+            reason=reason,
+        )
+        for index, (backend, model) in enumerate(candidates):
+            route.backend = backend
+            route.model = model.model_id
+            if index:
+                route.reason = "local_failure"
+            try:
+                result = model.summarize(evidence, findings)
+            except Exception as exc:
+                code = exc.code if isinstance(exc, SummaryError) else type(exc).__name__
+                metadata = exc.metadata if isinstance(exc, SummaryError) else None
+                route.attempts.append(
+                    LLMAttempt(
+                        backend=backend,
+                        model=model.model_id,
+                        status="unavailable",
+                        error=code,
+                        metadata=metadata,
+                    )
+                )
+                if index == len(candidates) - 1:
+                    raise SummaryError(code, metadata, route) from exc
+            else:
+                route.attempts.append(
+                    LLMAttempt(
+                        backend=backend,
+                        model=model.model_id,
+                        status="generated",
+                        metadata=result.metadata,
+                    )
+                )
+                result.routing = route
+                return result
+        raise RuntimeError("No LLM backend was selected")

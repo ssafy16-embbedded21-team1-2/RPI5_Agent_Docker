@@ -1,16 +1,16 @@
-from typing import Literal
-
-from rpi5_agent.models import LLMMetadata
+from rpi5_agent.models import LLMMetadata, LLMRouting
 
 
 class SummaryError(ValueError):
-    """A model response was received but cannot be used as a complete explanation."""
+    """A model call or response failed; only sanitized diagnostics are exposed."""
 
     def __init__(
         self,
-        code: Literal["output_truncated", "invalid_model_output", "unexpected_finish_reason"],
-        metadata: LLMMetadata,
+        code: str,
+        metadata: LLMMetadata | None = None,
+        routing: LLMRouting | None = None,
     ):
         super().__init__(code)
         self.code = code
         self.metadata = metadata
+        self.routing = routing

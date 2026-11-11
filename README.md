@@ -1,14 +1,15 @@
 # RPi 5 Diagnostic Agent
 
-Raspberry Pi 5에서 실행할 로컬 진단 Agent의 Docker 기반 시작 프로젝트입니다.
+Raspberry Pi 5에서 실행할 진단 Agent의 Docker 기반 시작 프로젝트입니다.
 LangGraph가 증거 수집 → 규칙 판정 → 결과 작성 순서를 실행하고,
-LangChain이 호스트의 `llama-server`에 설명 생성을 요청합니다.
+LangChain이 호스트의 `llama-server` 또는 선택적으로 Pamout 외부 LLM에 설명 생성을 요청합니다.
 
 **현재 모든 진단 입력은 가상 데이터입니다.** CAN·UDS·SWD의 실제 수집과 제어는 아직 구현하지 않았습니다.
 트랜시버와 모델 없이도 API와 진단 흐름을 실행할 수 있습니다.
 
 PC Docker에서 확인한 결과는 [Docker 검증 기록](docs/Docker_검증_기록.md),
 RPi 5와 실제 Qwen 연결 결과는 [RPi 5 검증 기록](docs/RPi5_검증_기록.md)을 참고하세요.
+PC에서 실제 외부 API를 호출한 결과는 [Pamout 실서비스 검증 기록](docs/Pamout_실서비스_검증_기록.md)에 있습니다.
 
 ## 1. 실행 구성
 
@@ -21,6 +22,7 @@ RPi 5 호스트 (64-bit Linux)
 ```
 
 Agent 컨테이너는 호스트의 모델 서버를 HTTP로 호출합니다.
+외부 기능을 설정하면 복잡한 요청·규칙상 오류 수준의 진단·로컬 추론 실패를 Pamout으로 보낼 수 있습니다.
 모델 파일, CUDA/PyTorch, 컴파일러, Docker 데몬을 Agent 이미지 안에 넣지 않습니다.
 이미지는 Python 3.12 기반이며 RPi에서 빌드하면 ARM64로, 일반 x64 PC에서 빌드하면 AMD64로 생성됩니다.
 
@@ -135,10 +137,101 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 
 이 단계는 **모델의 설명 생성만** 사용하며 native tool calling에 의존하지 않습니다.
 모델은 도구 선택이나 하드웨어 명령을 실행하지 않습니다.
-모델 서버가 Chat Completions의 `response_format` / JSON Schema 기반 출력을 지원해야 합니다.
-미지원 서버의 오류는 `llm_status=unavailable`로 반환하며 자유 형식으로 재요청하지 않습니다.
+로컬 모델 서버는 Chat Completions의 `response_format` / JSON Schema 출력을 지원해야 합니다.
+같은 서버에 자유 형식으로 재요청하지 않습니다. 외부 전환이 비활성화된 경우
+미지원 서버 오류는 `llm_status=unavailable`로 반환합니다. 외부 전환은 다음 절의 명시된 정책을 따릅니다.
 기존 2048 토큰 컨텍스트를 고려해 짧은 증거와 최대 256 토큰의 출력을 기본으로 사용합니다.
 설정을 늘리기 전 실제 모델의 토큰 사용량과 메모리를 측정합니다.
+
+### 4-1. Pamout 외부 LLM과 모델 선택
+
+[Pamout API 문서](https://signup.pamout.com/api-docs.html)를 2026-11-11 확인한 기준으로
+Chat Completions의 base URL은 `https://llm.pamout.com/v1`입니다.
+개인 키는 Bearer 인증에 사용하고 의미 있는 User-Agent를 보냅니다.
+`glm-5.3`은 문서 예제이며 실제 키로 조회한 `GET /v1/models`의 모델 ID를 설정해야 합니다.
+문서의 모델 목록은 관측 시점의 카탈로그이며 키별 접근 가능 모델을 보장하지 않습니다.
+
+기존 `.env`의 로컬 설정은 유지하고 다음 값을 추가합니다.
+처음 설치라면 `.env.example`을 복사한 뒤 수정합니다.
+
+```dotenv
+LLM_ENABLED=true
+EXTERNAL_LLM_ENABLED=true
+EXTERNAL_LLM_BASE_URL=https://llm.pamout.com/v1
+EXTERNAL_LLM_MODEL=glm-5.3
+EXTERNAL_LLM_API_KEY=본인의_개인_API_키로_교체
+EXTERNAL_LLM_USER_AGENT=rpi5-diagnostic-agent/0.1.0
+EXTERNAL_LLM_TIMEOUT_SECONDS=120
+EXTERNAL_LLM_MAX_TOKENS=4096
+EXTERNAL_LLM_RESPONSE_FORMAT=prompt
+EXTERNAL_LLM_FALLBACK_ON_LOCAL_FAILURE=true
+```
+
+실제 키는 추적되지 않는 `.env`에만 저장합니다. 외부 키가 비어 있는데 기능을 켜면 시작 시 설정 검증에 실패합니다.
+기본 예제에서는 전체 LLM과 외부 기능이 모두 꺼져 있습니다.
+로컬 요청은 HTTP를 허용하고 외부 URL은 HTTPS를 요구합니다. 모의 서버용 loopback HTTP는 예외입니다.
+
+문서에는 외부 JSON Schema 지원 여부가 명시되지 않아 기본 `prompt` 모드는
+`response_format`을 전송하지 않고 JSON 출력을 지시합니다.
+응답은 로컬과 동일하게 `finish_reason=stop` 및 엄격한 Pydantic 검증을 통과해야 합니다.
+코드 블록·자유 텍스트를 임의 추출하거나 잘린 JSON을 복구해 성공으로 처리하지 않습니다.
+서버 지원을 확인한 경우에만 `json_object` 또는 `json_schema` 모드를 설정합니다.
+이 모드 변경은 설정 선택이며 실패 후 같은 서버에 형식을 약하게 바꿔 재시도하는 기능은 없습니다.
+
+요청의 `llm_target`으로 선택합니다. 기존 요청은 생략하면 `auto`입니다.
+
+| 요청·조건 | 선택 | 응답의 `llm_routing.reason` |
+| --- | --- | --- |
+| `use_llm=false` | LLM 호출 없음 | `llm_routing=null` |
+| `llm_target=local` | 로컬만 사용, 실패해도 외부 전환 없음 | `explicit_local` |
+| `llm_target=external` | Pamout 직접 호출, 로컬 추론 불필요 | `explicit_external` |
+| `auto`, 외부 활성, `severity=error` findings 존재 | Pamout 직접 호출 | `error_findings` |
+| 그 외 `auto` | 우선 로컬 | `local_default` |
+| `auto`의 로컬 실패, 외부 활성, fallback 설정 켬 | Pamout 1회로 전환 | `local_failure` |
+
+현재 `bus_off` 시나리오는 오류 수준 finding이 있어 외부 활성 시 직접 Pamout을 선택합니다.
+`healthy`·`bms_timeout`은 우선 로컬을 사용합니다.
+오류 수준을 복잡도 신호로 쓰는 초기 규칙이며 실제 작업 난이도나 모델의 자신감을 측정한 것은 아닙니다.
+다른 복잡한 요청은 호출자가 `external`을 지정하고, 향후 실측 지표를 바탕으로 라우팅 정책을 확장합니다.
+
+외부가 비활성이면 `auto`는 로컬만 사용하고, 명시적인 `external` 요청은 HTTP 409입니다.
+`use_llm=false`인데 `local`/`external`을 지정하면 HTTP 422입니다.
+`EXTERNAL_LLM_FALLBACK_ON_LOCAL_FAILURE=false`는 로컬 실패 시 전환만 끕니다.
+오류 finding의 직접 외부 라우팅까지 막으려면 `local`을 지정하거나 외부 기능 전체를 끕니다.
+
+현재 외부에 보내는 내용은 기존과 같은 **fixture 증거의 tool·target·status·data 및 findings**입니다.
+외부 기능 활성화는 이 자료를 외부 API로 보낼 수 있는 설정입니다.
+향후 실측 데이터 공급자를 추가하면 전송 허용 필드·민감 정보 제거를 그 경계에서 별도 구현해야 합니다.
+외부 모델도 설명 생성에만 사용하며 도구 실행·제어 권한은 없습니다.
+두 필드의 1~50자 출력 계약은 유지하고 외부 모델의 출력 토큰 예산만 별도로 둡니다.
+
+컨테이너를 다시 빌드·재생성한 뒤 외부 지정 예제를 호출합니다.
+실제 API 키 설정 후의 호출은 외부 서비스 사용입니다.
+
+```bash
+docker compose config --quiet
+docker compose up -d --build --force-recreate
+curl -sS http://127.0.0.1:8000/diagnose \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/bms_timeout_external.json
+```
+
+자동 선택은 `examples/bus_off_auto_llm.json`으로 확인할 수 있습니다.
+`llm_routing`에는 최종 backend(`local`/`pamout`)·설정 모델 ID·선택 이유와
+각 호출의 성공/실패·오류 종류·종료 사유·사용 토큰을 남깁니다. URL·키·서버 오류 본문은 반환하지 않습니다.
+로컬 실패 후 외부 성공이면 `llm_status=generated`지만 첫 실패는 `attempts`에 남습니다.
+두 백엔드가 모두 실패하면 코드 판정과 관측 요약을 유지합니다.
+외부 장애를 이유로 다시 로컬을 호출하거나 순환 전환하지 않습니다.
+
+각 백엔드는 SDK 자동 재시도 없이 최대 한 번 호출합니다. 한 진단은 최대 두 번의 모델 호출을 수행합니다.
+기본 timeout은 각각 120초로, 순차 전환 시 두 대기 시간이 합산될 수 있습니다.
+이는 요청 전체의 엄밀한 벽시계 제한을 보장하지 않으며 그동안 다른 진단은 기존처럼 HTTP 429입니다.
+외부 429·인증 오류·timeout·출력 검증 실패는 안전한 오류 종류로 기록하고 무제한 재호출하지 않습니다.
+
+자동 테스트는 로컬 HTTP 모의 서버로 외부 경로를 검증합니다.
+2026-11-11에는 PC에서 실제 키의 모델 목록, `glm-5.3`의 prompt 모드와 세 가지 선택 경로를
+[실서비스로 확인](docs/Pamout_실서비스_검증_기록.md)했습니다.
+다른 JSON 모드·모델·추론 품질·반복 성능·RPi 실행 환경은 별도 검증이 필요합니다.
 
 ## 5. 구현된 범위
 
@@ -148,8 +241,9 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 | `healthy` | 게이트웨이와 BMS 데이터가 모두 최신인 예제 |
 | `bms_timeout` | 게이트웨이는 최신이고 BMS 원본만 오래된 예제 |
 | `bus_off` | RPi 로컬 어댑터 Bus-Off와 원격 상태 미확인을 구분 |
-| LLM 설명 | JSON Schema로 원인 후보와 추가 확인을 받아 Pydantic으로 검증 |
-| 모델 오류 | 연결 실패·출력 잘림·형식 오류 시 코드 기반 요약 유지 |
+| LLM 설명 | 로컬 JSON Schema 또는 설정한 외부 JSON 모드로 생성하고 같은 Pydantic 계약 검증 |
+| 모델 선택 | 요청별 `auto/local/external`, 오류 finding·로컬 실패 시 선택적 Pamout 전환 |
+| 모델 오류 | 호출 이력을 보존하고 최종 실패 시 코드 기반 요약 유지 |
 | 실제 CAN·UDS·SWD | 미구현. 현재 가상 데이터만 사용 |
 | 승인·제어·복구 | 미구현. 제어 API와 임의 명령 실행 경로 없음 |
 | 이력·RAG·대화 | 미구현. 요청별 처리이며 결과는 응답으로 반환 |
@@ -161,7 +255,8 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 
 모델 사용이 꺼져 있는데 `use_llm=true`로 요청하면 HTTP 409를 반환합니다.
 동시에 진단을 여러 번 요청하면 진행 중인 요청 외에는 HTTP 429를 반환합니다.
-모델 호출은 자동 재시도하지 않으며 기본 제한 시간은 120초입니다.
+같은 모델을 자동 재시도하지 않으며 기본 timeout은 백엔드별 120초입니다.
+외부 기능이 켜진 `auto`는 정책에 따라 다른 백엔드를 한 번 추가 호출할 수 있습니다.
 모델 실패는 HTTP 200 응답 안의 `llm_status=unavailable`로 구분하므로 호출자가 이 필드를 확인해야 합니다.
 
 ### 설명 출력과 종료 사유
@@ -181,7 +276,7 @@ Compose의 `extra_hosts`가 `host.docker.internal`을 Docker 호스트로 연결
 추가 확인: BMS 송신 기록과 게이트웨이 수신 기록을 비교하세요.
 ```
 
-API에는 기존 `summary`와 함께 구조화된 `explanation` 및 `llm_metadata`를 제공합니다.
+API에는 기존 `summary`와 함께 구조화된 `explanation`, `llm_metadata`, `llm_routing`을 제공합니다.
 `llm_metadata`의 `finish_reason`, `input_tokens`, `output_tokens`는 서버가 제공한 값이며,
 제공되지 않은 토큰 수는 `null`입니다.
 
@@ -196,7 +291,8 @@ API에는 기존 `summary`와 함께 구조화된 `explanation` 및 `llm_metadat
 
 실패한 모델 설명은 `explanation=null`로 반환합니다.
 유효한 JSON이라도 종료 사유가 `length`이면 잘린 출력으로 처리합니다.
-출력 글자 수 제한과 토큰 수 제한은 서로 다르므로 토큰 상한은 256으로 유지했습니다.
+출력 글자 수 제한과 토큰 수 제한은 서로 다릅니다. 기본 출력 토큰 예산은 로컬 256, 외부 4096이며
+외부 모델의 추론 방식·지원 파라미터를 실제 서비스에서 확인한 뒤 조정합니다.
 
 ## 6. 개발과 테스트
 
@@ -220,16 +316,18 @@ uv run --frozen uvicorn rpi5_agent.api:app --host 127.0.0.1 --port 8000
 테스트는 가상 시나리오 판정, 입력 검증, 모델 오류 시 증거 유지, 동시 요청 제한,
 로컬 HTTP 모형 서버를 통한 실제 LangChain API 호출과 구조화 출력을 검증합니다.
 출력 잘림, 비정상 종료, JSON 오류, 초과 길이·추가 필드·줄바꿈 등도 검사합니다.
+로컬·외부 모의 서버 두 개로 경로 선택·Bearer/User-Agent·실패 전환·외부 장애·timeout을 확인합니다.
+테스트는 실제 Pamout에 접속하지 않습니다.
 테스트 통과만으로 실제 Qwen 추론이나 RPi·STM32 연결이 검증되는 것은 아닙니다.
 
 ```text
 src/rpi5_agent/
 ├── api.py              HTTP 진입점과 동시 요청 제한
-├── config.py           환경변수와 로컬 모델 설정
+├── config.py           환경변수와 로컬/Pamout 설정·검증
 ├── models.py           입력·증거·진단 결과 형식
 ├── errors.py           사용 불가능한 모델 응답의 오류 코드와 메타데이터
 ├── workflow.py         LangGraph 흐름과 규칙 판정
-├── llm.py              LangChain 모델 설명 생성
+├── llm.py              요청별 모델 선택·LangChain 호출·공통 출력 검증
 └── tools/fixtures.py   가상 증거 공급자
 ```
 

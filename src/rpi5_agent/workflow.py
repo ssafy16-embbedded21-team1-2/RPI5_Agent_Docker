@@ -5,14 +5,27 @@ from uuid import uuid4
 from langgraph.graph import END, START, StateGraph
 
 from rpi5_agent.errors import SummaryError
-from rpi5_agent.models import DiagnoseRequest, Diagnosis, Finding, SummaryResult, ToolResult
+from rpi5_agent.models import (
+    DiagnoseRequest,
+    Diagnosis,
+    Finding,
+    LLMTarget,
+    SummaryResult,
+    ToolResult,
+)
 from rpi5_agent.tools.fixtures import collect_fixture
 
 logger = logging.getLogger(__name__)
 
 
 class Summarizer(Protocol):
-    def summarize(self, evidence: list[ToolResult], findings: list[Finding]) -> SummaryResult: ...
+    def summarize(
+        self,
+        evidence: list[ToolResult],
+        findings: list[Finding],
+        *,
+        target: LLMTarget = LLMTarget.AUTO,
+    ) -> SummaryResult: ...
 
 
 class DiagnosticState(TypedDict, total=False):
@@ -109,9 +122,12 @@ def build_workflow(summarizer: Summarizer | None = None):
             if summarizer is None:
                 raise RuntimeError("LLM was requested but no summarizer is configured")
             try:
-                model_result = summarizer.summarize(state["evidence"], state["findings"])
+                model_result = summarizer.summarize(
+                    state["evidence"], state["findings"], target=state["request"].llm_target
+                )
                 result.explanation = model_result.explanation
                 result.llm_metadata = model_result.metadata
+                result.llm_routing = model_result.routing
                 result.summary += (
                     f"\n원인 후보: {model_result.explanation.hypothesis}"
                     f"\n추가 확인: {model_result.explanation.next_check}"
@@ -123,6 +139,7 @@ def build_workflow(summarizer: Summarizer | None = None):
                 if isinstance(exc, SummaryError):
                     result.llm_error = exc.code
                     result.llm_metadata = exc.metadata
+                    result.llm_routing = exc.routing
                 else:
                     result.llm_error = type(exc).__name__
                 logger.warning("LLM summary unavailable: %s", result.llm_error)
