@@ -21,6 +21,16 @@ def main() -> int:
             ("healthy", "BMS_FRESH"),
             ("bms_timeout", "BMS_STALE"),
             ("bus_off", "REMOTE_STATE_UNKNOWN"),
+            ("ecu_unresponsive", "GATEWAY_EVIDENCE_UNAVAILABLE"),
+            ("ecu_rebooted", "ECU_BOOT_CHANGED"),
+            ("crash_recorded", "CRASH_RECORD_PRESENT"),
+            ("crash_record_absent", "CRASH_RECORD_ABSENT"),
+            ("crash_record_unsupported", "CRASH_RECORD_UNSUPPORTED"),
+            ("crash_record_timeout", "CRASH_RECORD_TIMEOUT"),
+            ("crash_record_invalid", "CRASH_RECORD_INVALID"),
+            ("symbols_missing", "SYMBOLS_MISSING"),
+            ("symbol_build_mismatch", "SYMBOL_BUILD_MISMATCH"),
+            ("debug_access_unavailable", "DEBUG_ACCESS_UNAVAILABLE"),
         ):
             request = Request(
                 f"{base_url}/diagnose",

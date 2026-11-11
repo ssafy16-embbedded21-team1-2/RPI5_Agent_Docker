@@ -404,3 +404,29 @@ def test_both_backends_failing_keep_both_attempts_and_code_generated_summary(mod
     assert attempts[0]["metadata"]["finish_reason"] == "length"
     assert [item["status"] for item in attempts] == ["unavailable", "unavailable"]
     assert len(local_requests) == len(external_requests) == 1
+
+
+def test_record_context_reaches_model_without_debug_commands_or_raw_dump(model_server):
+    base_url, requests, _ = model_server
+    settings = Settings(_env_file=None, llm_enabled=True, llm_base_url=base_url)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/diagnose",
+            json={
+                "scenario": "symbol_build_mismatch",
+                "use_llm": True,
+                "llm_target": "local",
+            },
+        )
+    result = response.json()
+    assert result["llm_status"] == "generated"
+    assert "SYMBOL_BUILD_MISMATCH" in {item["code"] for item in result["findings"]}
+    assert len(requests) == 1
+    payload = requests[0][1]
+    assert "tools" not in payload
+    evidence = json.loads(payload["messages"][1]["content"])["evidence"]
+    record = next(item for item in evidence if item["tool"] == "can.read_crash_record")
+    assert record["record_build_id"] == "firmware-at-fault"
+    assert record["running_build_id"] == "firmware-current"
+    symbols = next(item for item in evidence if item["tool"] == "analyze.symbols")
+    assert symbols["error"]["code"] == "symbol_build_mismatch"

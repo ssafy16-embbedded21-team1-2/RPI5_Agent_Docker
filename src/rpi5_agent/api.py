@@ -6,10 +6,16 @@ from fastapi import FastAPI, HTTPException
 from rpi5_agent.config import Settings
 from rpi5_agent.llm import RoutedSummarizer
 from rpi5_agent.models import DiagnoseRequest, Diagnosis, LLMTarget, Scenario
+from rpi5_agent.tools.collection import EvidenceProvider, allowed_tools
 from rpi5_agent.workflow import Summarizer, build_workflow
 
 
-def create_app(settings: Settings | None = None, summarizer: Summarizer | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    summarizer: Summarizer | None = None,
+    *,
+    provider: EvidenceProvider | None = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         config = settings if settings is not None else Settings()
@@ -17,7 +23,9 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
         if config.llm_enabled and model is None:
             model = RoutedSummarizer(config)
         app.state.settings = config
-        app.state.workflow = build_workflow(model)
+        app.state.workflow = build_workflow(
+            model, provider=provider, profile=config.diagnostic_profile
+        )
         app.state.diagnosis_slot = BoundedSemaphore(1)
         yield
 
@@ -31,6 +39,17 @@ def create_app(settings: Settings | None = None, summarizer: Summarizer | None =
     @app.get("/scenarios")
     def scenarios() -> dict:
         return {"mode": "fixture", "scenarios": [item.value for item in Scenario]}
+
+    @app.get("/capabilities")
+    def capabilities() -> dict:
+        profile = app.state.settings.diagnostic_profile
+        return {
+            "mode": "fixture",
+            "diagnostic_profile": profile,
+            "allowed_read_tools": sorted(allowed_tools(profile)),
+            "physical_collection": False,
+            "control_tools": False,
+        }
 
     @app.post("/diagnose", response_model=Diagnosis)
     def diagnose(request: DiagnoseRequest) -> Diagnosis:

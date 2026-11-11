@@ -3,9 +3,13 @@ from typing import Literal
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from rpi5_agent.models import DiagnosticProfile
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
+
+    diagnostic_profile: DiagnosticProfile = DiagnosticProfile.PRODUCT
 
     llm_enabled: bool = False
     llm_base_url: str = "http://127.0.0.1:8080/v1"

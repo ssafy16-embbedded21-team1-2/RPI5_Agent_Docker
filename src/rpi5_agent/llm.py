@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from rpi5_agent.config import Settings
 from rpi5_agent.errors import SummaryError
+from rpi5_agent.evidence_summary import build_model_payload
 from rpi5_agent.models import (
     Finding,
     LLMAttempt,
@@ -43,14 +44,7 @@ class ChatSummarizer:
 
     def summarize(self, evidence: list[ToolResult], findings: list[Finding]) -> SummaryResult:
         # Keep the request small for the existing 2048-token llama-server configuration.
-        payload = {
-            "mode": "fixture",
-            "evidence": [
-                item.model_dump(mode="json", include={"tool", "target", "status", "data"})
-                for item in evidence
-            ],
-            "findings": [item.model_dump(include={"code", "message"}) for item in findings],
-        }
+        payload = build_model_payload(evidence, findings)
         messages = [
             SystemMessage(
                 content=(
@@ -63,6 +57,11 @@ class ChatSummarizer:
                     "'현재 증거만으로 원인을 특정할 수 없습니다.'라고 쓰세요. "
                     "정상 판정이면 고장을 만들지 마세요. 미관측 수치와 DTC를 추가하지 마세요. "
                     "로컬 Bus-Off를 원격 ECU 상태로 해석하거나 펌웨어 손상을 단정하지 마세요."
+                    "저장 기록은 과거 사건입니다. 현재 빌드와 기록 빌드, 부팅을 구분하세요. "
+                    "미지원·조회 실패·기록 없음은 서로 다르며 정상의 근거가 아닙니다. "
+                    "심벌·예외 프레임이 불명확하면 함수나 소스 줄을 추측하지 마세요. "
+                    "SWD 접근 불가를 보안 잠금으로 단정하지 마세요. "
+                    "보호 해제·정지·리셋·플래싱을 제안하지 마세요."
                 )
             ),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),

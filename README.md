@@ -5,6 +5,10 @@ LangGraph가 증거 수집 → 규칙 판정 → 결과 작성 순서를 실행�
 LangChain이 호스트의 `llama-server` 또는 선택적으로 Pamout 외부 LLM에 설명 생성을 요청합니다.
 
 **현재 모든 진단 입력은 가상 데이터입니다.** CAN·UDS·SWD의 실제 수집과 제어는 아직 구현하지 않았습니다.
+
+제품 운용에서는 CAN 진단 기록을 주 증거로 삼고 SWD를 선택 경로로 두는
+[SWD 없는 진단 구조](docs/SWD_선택_진단_구조.md)를 반영했습니다.
+기본 `DIAGNOSTIC_PROFILE=product`는 SWD 요청을 공급자 실행 전에 차단합니다.
 트랜시버와 모델 없이도 API와 진단 흐름을 실행할 수 있습니다.
 
 PC Docker에서 확인한 결과는 [Docker 검증 기록](docs/Docker_검증_기록.md),
@@ -200,7 +204,8 @@ EXTERNAL_LLM_FALLBACK_ON_LOCAL_FAILURE=true
 `EXTERNAL_LLM_FALLBACK_ON_LOCAL_FAILURE=false`는 로컬 실패 시 전환만 끕니다.
 오류 finding의 직접 외부 라우팅까지 막으려면 `local`을 지정하거나 외부 기능 전체를 끕니다.
 
-현재 외부에 보내는 내용은 기존과 같은 **fixture 증거의 tool·target·status·data 및 findings**입니다.
+현재 외부에 보내는 내용은 **fixture 증거의 허용된 데이터·출처·유효성·기록 문맥·구조화된 오류 및 findings**입니다.
+임의 로그·스택 덤프·자유 형식 오류는 전달하지 않고 입력 크기도 제한합니다.
 외부 기능 활성화는 이 자료를 외부 API로 보낼 수 있는 설정입니다.
 향후 실측 데이터 공급자를 추가하면 전송 허용 필드·민감 정보 제거를 그 경계에서 별도 구현해야 합니다.
 외부 모델도 설명 생성에만 사용하며 도구 실행·제어 권한은 없습니다.
@@ -244,6 +249,8 @@ curl -sS http://127.0.0.1:8000/diagnose \
 | `healthy` | 게이트웨이와 BMS 데이터가 모두 최신인 예제 |
 | `bms_timeout` | 게이트웨이는 최신이고 BMS 원본만 오래된 예제 |
 | `bus_off` | RPi 로컬 어댑터 Bus-Off와 원격 상태 미확인을 구분 |
+| 부팅·크래시 기록 | 가상 조회로 부팅 변경·저장 기록 없음/미지원/시간 초과/손상·심벌 부재/불일치 구분 |
+| SWD 정책 | 기본 제품 프로필에서 실행 전 차단. 벤치도 읽기 허용 목록만 지원 |
 | LLM 설명 | 로컬 JSON Schema 또는 설정한 외부 JSON 모드로 생성하고 같은 Pydantic 계약 검증 |
 | 모델 선택 | 요청별 `auto/local/external`, 오류 finding·로컬 실패 시 선택적 Pamout 전환 |
 | 모델 오류 | 호출 이력을 보존하고 최종 실패 시 코드 기반 요약 유지 |
@@ -251,7 +258,7 @@ curl -sS http://127.0.0.1:8000/diagnose \
 | 승인·제어·복구 | 미구현. 제어 API와 임의 명령 실행 경로 없음 |
 | 이력·RAG·대화 | 미구현. 요청별 처리이며 결과는 응답으로 반환 |
 
-공통 증거 응답은 `target`, `timestamp`, `status`, `data`, `error`를 포함합니다.
+공통 증거 응답은 `target`, `timestamp`, `status`, `data`, `error`와 원본 ECU·기록 Build ID·부팅·유효성 메타데이터를 포함합니다.
 `source=fixture`와 결과의 `mode=fixture`로 실제 측정과 구분합니다.
 오류 카운터 미확인은 `null`이며 0으로 대체하지 않습니다.
 예제의 타임아웃 500/1000ms는 테스트용 값으로 실제 통신 규약의 확정값이 아닙니다.
@@ -329,9 +336,13 @@ src/rpi5_agent/
 ├── config.py           환경변수와 로컬/Pamout 설정·검증
 ├── models.py           입력·증거·진단 결과 형식
 ├── errors.py           사용 불가능한 모델 응답의 오류 코드와 메타데이터
-├── workflow.py         LangGraph 흐름과 규칙 판정
+├── workflow.py         LangGraph 수집·판정·설명 연결
+├── assessment.py       순서·누락과 독립된 증거 검증·판정
+├── evidence_summary.py 모델 입력 필드·크기 제한
 ├── llm.py              요청별 모델 선택·LangChain 호출·공통 출력 검증
-└── tools/fixtures.py   가상 증거 공급자
+└── tools/
+    ├── collection.py   수집기 계약·프로필·실행 전 도구 검사
+    └── fixtures.py     가상 증거 공급자
 ```
 
 ## 7. 운영 명령과 자원 확인
@@ -357,6 +368,10 @@ docker compose down
 3. `gateway.snapshot`에 원본 BMS의 유효 여부와 경과시간을 연결합니다.
 4. 가상 데이터와 실측 데이터의 출처를 결과에서 계속 구분합니다.
 5. 승인 정보와 대상·명령·파라미터를 검증하는 공통 계층을 만든 뒤 제어 기능을 추가합니다.
+6. 원본 진단 기록을 보관하고, 기록 Build ID별 ELF 검증·심벌 해석을 연결합니다.
+
+SWD 없는 진단의 증거 계약·제품/벤치 정책·가상 시나리오는
+[구현 설명](docs/SWD_선택_진단_구조.md)을 참고하세요. 실제 CAN 수집·심벌 해석·영구 저장은 후속 구현 범위입니다.
 
 Agent가 직접 SocketCAN을 사용하도록 확장한다면 `can0`은 `/dev/can0` 파일이 아닌 네트워크 인터페이스임에 유의합니다.
 현재 bridge 구성에 장치를 마운트하는 것만으로 `can0`가 나타나지는 않습니다.
