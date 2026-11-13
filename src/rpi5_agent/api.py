@@ -6,7 +6,14 @@ from fastapi import FastAPI, HTTPException
 from rpi5_agent.config import Settings
 from rpi5_agent.llm import RoutedSummarizer
 from rpi5_agent.models import DiagnoseRequest, Diagnosis, LLMTarget, Scenario
+from rpi5_agent.specification import FIXTURE_SPECIFICATION
 from rpi5_agent.tools.collection import EvidenceProvider, allowed_tools
+from rpi5_agent.verification import (
+    CASE_CATALOG_ID,
+    EXPECTED_CODES,
+    FixtureVerification,
+    verify_fixture,
+)
 from rpi5_agent.workflow import Summarizer, build_workflow
 
 
@@ -49,10 +56,25 @@ def create_app(
             "allowed_read_tools": sorted(allowed_tools(profile)),
             "physical_collection": False,
             "control_tools": False,
+            "project_focus": "known_equipment_verification",
+            "assessment_specification_id": FIXTURE_SPECIFICATION.id,
+            "fixture_verification": provider is None,
         }
 
-    @app.post("/diagnose", response_model=Diagnosis)
-    def diagnose(request: DiagnoseRequest) -> Diagnosis:
+    @app.get("/verification/specification")
+    def verification_specification() -> dict:
+        return {
+            "available": provider is None,
+            "specification": FIXTURE_SPECIFICATION.model_dump(mode="json"),
+            "case_catalog_id": CASE_CATALOG_ID,
+            "physical_validation": False,
+            "cases": [
+                {"case_id": case, "expected_finding_codes": sorted(expected)}
+                for case, expected in EXPECTED_CODES.items()
+            ],
+        }
+
+    def run_diagnosis(request: DiagnoseRequest) -> Diagnosis:
         if request.use_llm and not app.state.settings.llm_enabled:
             raise HTTPException(
                 status_code=409, detail="Set LLM_ENABLED=true to request a model summary"
@@ -66,6 +88,18 @@ def create_app(
             return app.state.workflow.invoke({"request": request})["result"]
         finally:
             app.state.diagnosis_slot.release()
+
+    @app.post("/diagnose", response_model=Diagnosis)
+    def diagnose(request: DiagnoseRequest) -> Diagnosis:
+        return run_diagnosis(request)
+
+    @app.post("/verify", response_model=FixtureVerification)
+    def verify(request: DiagnoseRequest) -> FixtureVerification:
+        # A custom provider has no reviewed acceptance suite. Never silently grade it
+        # as the built-in fixture, even if it implements the same Python protocol.
+        if provider is not None:
+            raise HTTPException(status_code=409, detail="No acceptance suite for this provider")
+        return verify_fixture(run_diagnosis(request))
 
     return app
 

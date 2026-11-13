@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rpi5_agent.specification import FIXTURE_SPECIFICATION
+
 
 class Scenario(StrEnum):
     HEALTHY = "healthy"
@@ -155,6 +157,7 @@ class Diagnosis(BaseModel):
     request_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     mode: Literal["fixture"] = "fixture"
+    assessment_specification_id: str = FIXTURE_SPECIFICATION.id
     scenario: Scenario
     diagnostic_profile: DiagnosticProfile = DiagnosticProfile.PRODUCT
     evidence: list[ToolResult]

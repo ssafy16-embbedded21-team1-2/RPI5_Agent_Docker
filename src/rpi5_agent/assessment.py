@@ -3,6 +3,7 @@
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rpi5_agent.models import Finding, ToolError, ToolResult
+from rpi5_agent.specification import FIXTURE_SPECIFICATION
 
 
 class DecodedData(BaseModel):
@@ -15,9 +16,7 @@ class BusStateData(DecodedData):
 
 class GatewayData(DecodedData):
     gateway_age_ms: float = Field(ge=0)
-    gateway_timeout_ms: float = Field(gt=0)
     bms_age_ms: float = Field(ge=0)
-    bms_timeout_ms: float = Field(gt=0)
     bms_valid: bool
 
 
@@ -102,7 +101,10 @@ def evaluate(evidence: list[ToolResult]) -> list[Finding]:
                     "게이트웨이의 유효한 증거를 수집하지 못했습니다. 원격 ECU 고장은 미확인입니다.",
                 )
             )
-        elif gateway.freshness == "stale" or data.gateway_age_ms > data.gateway_timeout_ms:
+        elif (
+            gateway.freshness == "stale"
+            or data.gateway_age_ms > FIXTURE_SPECIFICATION.gateway_timeout_ms
+        ):
             findings.append(
                 finding(
                     "GATEWAY_STALE",
@@ -113,7 +115,7 @@ def evaluate(evidence: list[ToolResult]) -> list[Finding]:
             findings.append(
                 finding("GATEWAY_FRESH", "게이트웨이 집계 데이터는 최근에 갱신되었습니다.", "info")
             )
-            if data.bms_age_ms > data.bms_timeout_ms:
+            if data.bms_age_ms > FIXTURE_SPECIFICATION.bms_timeout_ms:
                 findings.append(
                     finding(
                         "BMS_STALE",
@@ -122,7 +124,7 @@ def evaluate(evidence: list[ToolResult]) -> list[Finding]:
                 )
             if not data.bms_valid:
                 findings.append(finding("BMS_INVALID", "BMS 값이 유효하지 않습니다."))
-            elif data.bms_age_ms <= data.bms_timeout_ms:
+            elif data.bms_age_ms <= FIXTURE_SPECIFICATION.bms_timeout_ms:
                 findings.append(
                     finding("BMS_FRESH", "BMS 값은 유효하며 최근에 갱신되었습니다.", "info")
                 )

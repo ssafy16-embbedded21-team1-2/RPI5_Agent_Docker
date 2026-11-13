@@ -18,10 +18,8 @@ def collect_fixture(scenario: Scenario) -> list[ToolResult]:
         if bus_off
         else {
             "gateway_age_ms": 20,
-            "gateway_timeout_ms": 500,
             "bms_age_ms": 2500 if scenario == Scenario.BMS_TIMEOUT else 50,
             "bms_valid": True,
-            "bms_timeout_ms": 1000,
         },
         error="No fresh gateway evidence available" if bus_off else None,
     )

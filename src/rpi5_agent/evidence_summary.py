@@ -4,14 +4,13 @@ import json
 
 from rpi5_agent.errors import SummaryError
 from rpi5_agent.models import Finding, ToolError, ToolResult
+from rpi5_agent.specification import FIXTURE_SPECIFICATION
 
 DATA_FIELDS = {
     "can.bus_state": {"state", "tec", "rec"},
     "gateway.snapshot": {
         "gateway_age_ms",
-        "gateway_timeout_ms",
         "bms_age_ms",
-        "bms_timeout_ms",
         "bms_valid",
     },
     "can.read_boot_record": {"previous_boot_id", "current_boot_id"},
@@ -66,6 +65,7 @@ def build_model_payload(evidence: list[ToolResult], findings: list[Finding]) -> 
         compact.append(view)
     payload = {
         "mode": "fixture",
+        "assessment_specification": FIXTURE_SPECIFICATION.model_dump(mode="json"),
         "evidence": compact,
         "findings": [item.model_dump(include={"code", "message"}) for item in findings],
     }
