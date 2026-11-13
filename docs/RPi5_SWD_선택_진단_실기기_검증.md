@@ -4,18 +4,21 @@
 
 **결과**: ARM64 배포·자동 테스트 112개·가상 진단 13종·제품/벤치 정책은 통과했다. 실제 모델 5건 중 4건은 출력 계약을 통과했고 1건은 검증 실패로 제외됐다. Qwen의 사실과 다른 설명 및 스로틀링이 확인돼 설명 품질·반복 성능은 통과로 판단하지 않는다.
 
+후속 기록: 쿨러 장착 후 [2026-11-13 냉각 검증](RPi5_액티브쿨러_검증_기록.md)에서는 단기 부하 중 최고 69.4°C,
+팬 자동 제어와 스로틀링 없음을 확인했다. 아래 결과는 11월 11일 당시의 측정이며, 설명 품질·장시간 반복 성능은 계속 미검증이다.
+
 ## 1. 배포와 범위
 
-| 항목 | 확인값 |
-| --- | --- |
-| RPi | `pi32`, `pi@100.92.169.70`, `aarch64` |
-| 배포 경로 | `/home/pi/RPI5_Agent_Docker` |
-| 배포 커밋 | `9682de33a9a84a278fe6c8ab337b30b33608fe20` |
-| 이전 커밋 | `e5b62df601b8fb64eeff99bac577b799e8ab7b6c` |
-| 새 ARM64 이미지 | `sha256:0de4c6ff0c4997c413a5cd3036158489914a25faa21fbbe9784f559727ddfd12` |
-| 운영 프로필 | `product`, SWD 공급자 실행 전 차단 |
-| 로컬·외부 모델 ID | `local-qwen`, Pamout `glm-5.3` |
-| 진단 입력 | 모두 `fixture`. 실제 ECU·CAN·UDS·SWD 접근과 ELF 해석은 미검증 |
+| 항목              | 확인값                                                                    |
+| ----------------- | ------------------------------------------------------------------------- |
+| RPi               | `pi32`, `pi@100.92.169.70`, `aarch64`                                     |
+| 배포 경로         | `/home/pi/RPI5_Agent_Docker`                                              |
+| 배포 커밋         | `9682de33a9a84a278fe6c8ab337b30b33608fe20`                                |
+| 이전 커밋         | `e5b62df601b8fb64eeff99bac577b799e8ab7b6c`                                |
+| 새 ARM64 이미지   | `sha256:0de4c6ff0c4997c413a5cd3036158489914a25faa21fbbe9784f559727ddfd12` |
+| 운영 프로필       | `product`, SWD 공급자 실행 전 차단                                        |
+| 로컬·외부 모델 ID | `local-qwen`, Pamout `glm-5.3`                                            |
+| 진단 입력         | 모두 `fixture`. 실제 ECU·CAN·UDS·SWD 접근과 ELF 해석은 미검증             |
 
 사용자가 push한 원격 main의 커밋 일치를 확인한 뒤 clean RPi 작업 트리를 fast-forward했다. RPi에서 native ARM64 빌드 후 컨테이너를 재생성했다. RPi 최종 HEAD는 위 커밋이며 작업 트리는 clean이다. 이후 작성한 이 검증 기록은 별도 로컬 변경이다.
 
@@ -40,13 +43,13 @@
 
 `python3 scripts/smoke_test.py`로 **13개 시나리오를 모두 통과**했다.
 
-| 범위 | 결과 |
-| --- | --- |
-| 기존 정상·BMS 지연·로컬 Bus-Off | 기존 finding 유지 |
-| ECU 조회 시간 초과·부팅 변경 | 원인 미확인과 부팅 식별값 변경 구분 |
-| 크래시 있음/없음·미지원·시간 초과·손상 | 상태와 코드 판정 구분 |
-| 심벌 없음·빌드 불일치 | 함수·소스 줄을 채우지 않고 미확인으로 처리 |
-| 제품 SWD 접근 | `debug_access_unavailable`, `reason=profile_disabled` |
+| 범위                                   | 결과                                                  |
+| -------------------------------------- | ----------------------------------------------------- |
+| 기존 정상·BMS 지연·로컬 Bus-Off        | 기존 finding 유지                                     |
+| ECU 조회 시간 초과·부팅 변경           | 원인 미확인과 부팅 식별값 변경 구분                   |
+| 크래시 있음/없음·미지원·시간 초과·손상 | 상태와 코드 판정 구분                                 |
+| 심벌 없음·빌드 불일치                  | 함수·소스 줄을 채우지 않고 미확인으로 처리            |
+| 제품 SWD 접근                          | `debug_access_unavailable`, `reason=profile_disabled` |
 
 `/health`, `/scenarios`, `/capabilities`, `/docs`, `/openapi.json`은 모두 HTTP 200이었다. `/capabilities`는 `product`, `physical_collection=false`, `control_tools=false`이며 허용 도구에 SWD가 없었다. 진단 요청으로 `diagnostic_profile=bench`를 넣으면 HTTP 422였다.
 
@@ -54,13 +57,13 @@
 
 ## 4. 실제 모델 요청
 
-| 경로·시나리오 | 선택 이유 | 시간 | 입력/출력 토큰 | 출력 계약 결과 |
-| --- | --- | --- | --- | --- |
-| `local`, `crash_recorded` | `explicit_local` | 42.32초 | 742 / 41 | generated, stop |
-| `external`, `symbol_build_mismatch` | `explicit_external` | 14.00초 | 846 / 1253 | generated, stop |
-| `auto`, `crash_recorded` | `error_findings` | 13.75초 | 775 / 1316 | unavailable, invalid_model_output |
-| `auto`, `healthy` | `local_default` | 11.44초 | 529 / 39 | generated, stop |
-| 격리 로컬 접속 실패 후 `auto`, SWD 접근 불가 | `local_failure` | 13.21초 | 674 / 1130 | generated, stop |
+| 경로·시나리오                                | 선택 이유           | 시간    | 입력/출력 토큰 | 출력 계약 결과                    |
+| -------------------------------------------- | ------------------- | ------- | -------------- | --------------------------------- |
+| `local`, `crash_recorded`                    | `explicit_local`    | 42.32초 | 742 / 41       | generated, stop                   |
+| `external`, `symbol_build_mismatch`          | `explicit_external` | 14.00초 | 846 / 1253     | generated, stop                   |
+| `auto`, `crash_recorded`                     | `error_findings`    | 13.75초 | 775 / 1316     | unavailable, invalid_model_output |
+| `auto`, `healthy`                            | `local_default`     | 11.44초 | 529 / 39       | generated, stop                   |
+| 격리 로컬 접속 실패 후 `auto`, SWD 접근 불가 | `local_failure`     | 13.21초 | 674 / 1130     | generated, stop                   |
 
 Qwen 실제 요청 2건, Pamout 실제 Chat Completions 3건을 수행했다. 마지막 실패 주입은 배포 컨테이너의 분리된 프로세스에서 설정 복사본의 로컬 주소를 접속 불가 loopback으로 바꿨다. 운영 Qwen을 중지하거나 운영 설정을 바꾸지 않았다. 이력은 로컬 `OpenAIConnectionError` 후 Pamout 1회 성공이었다.
 
