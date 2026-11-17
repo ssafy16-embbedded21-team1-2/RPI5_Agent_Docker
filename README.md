@@ -15,6 +15,8 @@ LangChain이 호스트의 `llama-server` 또는 선택적으로 Pamout 외부 LL
 [SWD 없는 진단 구조](docs/SWD_선택_진단_구조.md)를 반영했습니다.
 기본 `DIAGNOSTIC_PROFILE=product`는 SWD 요청을 공급자 실행 전에 차단합니다.
 트랜시버와 모델 없이도 API와 진단 흐름을 실행할 수 있습니다.
+실측 CAN(`can0`)·보조 UART 연동 아키텍처와 호스트 수집 브리지 설계 초안은
+[실측 CAN·UART 연동 설계](docs/실측_CAN_UART_연동_설계.md)를 참고하세요.
 
 PC Docker에서 확인한 결과는 [Docker 검증 기록](docs/Docker_검증_기록.md),
 RPi 5와 실제 Qwen 연결 결과는 [RPi 5 검증 기록](docs/RPi5_검증_기록.md)을 참고하세요.
@@ -386,6 +388,8 @@ docker compose down
 
 SWD 없는 진단의 증거 계약·제품/벤치 정책·가상 시나리오는
 [구현 설명](docs/SWD_선택_진단_구조.md)을 참고하세요. 실제 CAN 수집·심벌 해석·영구 저장은 후속 구현 범위입니다.
+실물 RPi 5(`can0`) 및 STM32 보조 UART 기반의 호스트 수집 데몬 ↔ Agent 브리지·모듈 확장 설계는
+[실측 CAN·UART 연동 설계](docs/실측_CAN_UART_연동_설계.md)에 정리했습니다.
 
 Agent가 직접 SocketCAN을 사용하도록 확장한다면 `can0`은 `/dev/can0` 파일이 아닌 네트워크 인터페이스임에 유의합니다.
 현재 bridge 구성에 장치를 마운트하는 것만으로 `can0`가 나타나지는 않습니다.
