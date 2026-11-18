@@ -45,11 +45,15 @@ class ChatSummarizer:
     def summarize(self, evidence: list[ToolResult], findings: list[Finding]) -> SummaryResult:
         # Keep the request small for the existing 2048-token llama-server configuration.
         payload = build_model_payload(evidence, findings)
+        intro = (
+            "실측 CAN·UART 데이터의 findings에 대한 진단 보조 설명을 작성하세요. "
+            if payload.get("mode") == "live"
+            else "가상 데이터의 findings에 대한 진단 보조 설명을 작성하세요. "
+        )
         messages = [
             SystemMessage(
                 content=(
-                    "가상 데이터의 findings에 대한 진단 보조 설명을 작성하세요. "
-                    "hypothesis(원인 후보), next_check(추가 확인) "
+                    intro + "hypothesis(원인 후보), next_check(추가 확인) "
                     "두 필드만 가진 JSON을 출력하세요. "
                     "각 값은 한국어 한 문장, 50자 이내입니다. 목록과 줄바꿈은 쓰지 마세요. "
                     "관측 사실을 반복하지 말고 원인 후보 하나와 확인 방법 하나만 쓰세요. "

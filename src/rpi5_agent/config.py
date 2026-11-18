@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     diagnostic_profile: DiagnosticProfile = DiagnosticProfile.PRODUCT
+    evidence_provider: Literal["fixture", "http_collector"] = "fixture"
+    collector_base_url: str = "http://127.0.0.1:8090"
+    collector_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    collector_can_interface: str = Field(default="can0", pattern=r"^[a-zA-Z0-9_.-]{1,16}$")
+    collector_uart_target: str = Field(default="hw_test_f103", pattern=r"^[a-zA-Z0-9_.-]{1,64}$")
 
     llm_enabled: bool = False
     llm_base_url: str = "http://127.0.0.1:8080/v1"
@@ -28,7 +33,7 @@ class Settings(BaseSettings):
     external_llm_response_format: Literal["prompt", "json_object", "json_schema"] = "prompt"
     external_llm_fallback_on_local_failure: bool = True
 
-    @field_validator("llm_base_url", "external_llm_base_url")
+    @field_validator("llm_base_url", "external_llm_base_url", "collector_base_url")
     @classmethod
     def validate_base_url(cls, value: str, info: ValidationInfo) -> str:
         from urllib.parse import urlsplit

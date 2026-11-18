@@ -63,6 +63,8 @@ class FixtureVerification(BaseModel):
 
 
 def verify_fixture(diagnosis: Diagnosis) -> FixtureVerification:
+    if diagnosis.scenario is None:
+        raise ValueError("Fixture verification requires a synthetic Scenario")
     expected = EXPECTED_CODES[diagnosis.scenario]
     actual = Counter(item.code for item in diagnosis.findings)
     missing = sorted(expected - actual.keys())

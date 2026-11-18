@@ -70,9 +70,20 @@ class ToolResult(BaseModel):
     target: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     status: Literal["ok", "unavailable", "error", "unsupported", "timeout", "invalid"]
-    source: Literal["fixture"] = "fixture"
+    source: Literal["fixture", "live_can", "live_uart", "manual_measurement"] = "fixture"
     origin_ecu: str | None = Field(default=None, max_length=64)
-    transport: Literal["direct", "gateway_cache", "can_record", "bench_swd"] | None = None
+    transport: (
+        Literal[
+            "direct",
+            "gateway_cache",
+            "can_record",
+            "bench_swd",
+            "socketcan",
+            "uart_text",
+            "uart_json",
+        ]
+        | None
+    ) = None
     boot_id: str | None = Field(default=None, max_length=64)
     schema_version: str | None = Field(default=None, max_length=32)
     running_build_id: str | None = Field(default=None, max_length=64)
@@ -156,9 +167,9 @@ class SummaryResult(BaseModel):
 class Diagnosis(BaseModel):
     request_id: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    mode: Literal["fixture"] = "fixture"
+    mode: Literal["fixture", "live"] = "fixture"
     assessment_specification_id: str = FIXTURE_SPECIFICATION.id
-    scenario: Scenario
+    scenario: Scenario | None = None
     diagnostic_profile: DiagnosticProfile = DiagnosticProfile.PRODUCT
     evidence: list[ToolResult]
     findings: list[Finding]

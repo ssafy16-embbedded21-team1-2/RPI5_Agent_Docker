@@ -6,8 +6,9 @@ from fastapi import FastAPI, HTTPException
 from rpi5_agent.config import Settings
 from rpi5_agent.llm import RoutedSummarizer
 from rpi5_agent.models import DiagnoseRequest, Diagnosis, LLMTarget, Scenario
-from rpi5_agent.specification import FIXTURE_SPECIFICATION
+from rpi5_agent.specification import FIXTURE_SPECIFICATION, HW_TEST_SPECIFICATION
 from rpi5_agent.tools.collection import EvidenceProvider, allowed_tools
+from rpi5_agent.tools.live_provider import HttpHardwareProvider
 from rpi5_agent.verification import (
     CASE_CATALOG_ID,
     EXPECTED_CODES,
@@ -26,12 +27,22 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         config = settings if settings is not None else Settings()
+        effective_provider = provider
+        if effective_provider is None and config.evidence_provider == "http_collector":
+            effective_provider = HttpHardwareProvider(
+                base_url=config.collector_base_url,
+                timeout_seconds=config.collector_timeout_seconds,
+                can_interface=config.collector_can_interface,
+                uart_target=config.collector_uart_target,
+            )
         model = summarizer
         if config.llm_enabled and model is None:
             model = RoutedSummarizer(config)
         app.state.settings = config
+        app.state.provider = effective_provider
+        app.state.mode = getattr(effective_provider, "mode", "fixture")
         app.state.workflow = build_workflow(
-            model, provider=provider, profile=config.diagnostic_profile
+            model, provider=effective_provider, profile=config.diagnostic_profile
         )
         app.state.diagnosis_slot = BoundedSemaphore(1)
         yield
@@ -41,30 +52,37 @@ def create_app(
     @app.get("/health")
     def health() -> dict:
         # Liveness only: this does not probe the model or any physical hardware.
-        return {"status": "ok", "mode": "fixture", "llm_enabled": app.state.settings.llm_enabled}
+        return {
+            "status": "ok",
+            "mode": app.state.mode,
+            "llm_enabled": app.state.settings.llm_enabled,
+        }
 
     @app.get("/scenarios")
     def scenarios() -> dict:
-        return {"mode": "fixture", "scenarios": [item.value for item in Scenario]}
+        return {"mode": app.state.mode, "scenarios": [item.value for item in Scenario]}
 
     @app.get("/capabilities")
     def capabilities() -> dict:
         profile = app.state.settings.diagnostic_profile
+        is_live = app.state.mode == "live"
         return {
-            "mode": "fixture",
+            "mode": app.state.mode,
             "diagnostic_profile": profile,
             "allowed_read_tools": sorted(allowed_tools(profile)),
-            "physical_collection": False,
+            "physical_collection": is_live,
             "control_tools": False,
             "project_focus": "known_equipment_verification",
-            "assessment_specification_id": FIXTURE_SPECIFICATION.id,
-            "fixture_verification": provider is None,
+            "assessment_specification_id": (
+                HW_TEST_SPECIFICATION.id if is_live else FIXTURE_SPECIFICATION.id
+            ),
+            "fixture_verification": app.state.provider is None,
         }
 
     @app.get("/verification/specification")
     def verification_specification() -> dict:
         return {
-            "available": provider is None,
+            "available": app.state.provider is None,
             "specification": FIXTURE_SPECIFICATION.model_dump(mode="json"),
             "case_catalog_id": CASE_CATALOG_ID,
             "physical_validation": False,
@@ -97,7 +115,7 @@ def create_app(
     def verify(request: DiagnoseRequest) -> FixtureVerification:
         # A custom provider has no reviewed acceptance suite. Never silently grade it
         # as the built-in fixture, even if it implements the same Python protocol.
-        if provider is not None:
+        if app.state.provider is not None:
             raise HTTPException(status_code=409, detail="No acceptance suite for this provider")
         return verify_fixture(run_diagnosis(request))
 

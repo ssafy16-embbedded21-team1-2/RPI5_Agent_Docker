@@ -3,7 +3,11 @@
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rpi5_agent.models import Finding, ToolError, ToolResult
-from rpi5_agent.specification import FIXTURE_SPECIFICATION
+from rpi5_agent.specification import (
+    FIXTURE_SPECIFICATION,
+    HW_TEST_SPECIFICATION,
+    LiveHwTestSpecification,
+)
 
 
 class DecodedData(BaseModel):
@@ -31,6 +35,41 @@ class CrashData(DecodedData):
     stacked_pc: int | None = Field(default=None, ge=0, le=0xFFFFFFFF)
 
 
+class LiveBusStateData(DecodedData):
+    state: str
+    operstate: str
+    can_state: str
+    rx_errors: int = Field(default=0, ge=0)
+    tx_errors: int = Field(default=0, ge=0)
+    bus_errors: int = Field(default=0, ge=0)
+
+
+class LiveCanCaptureData(DecodedData):
+    can_id: str
+    frame_count_in_window: int = Field(ge=0)
+    valid_frame_count_in_window: int = Field(ge=0)
+    invalid_frame_count_in_window: int = Field(ge=0)
+    sequence_gap_count: int = Field(ge=0)
+    age_ms: float | None = Field(default=None, ge=0)
+    magic_ok: bool | None = None
+
+
+class LiveUartData(DecodedData):
+    sample_age_ms: float = Field(ge=0)
+    tec: int = Field(ge=0)
+    rec: int = Field(ge=0)
+    ewg: int = Field(ge=0)
+    epv: int = Field(ge=0)
+    boff: int = Field(ge=0)
+    txreq: int = Field(ge=0)
+    txok: int = Field(ge=0)
+    errcb: int = Field(ge=0)
+    epoch_continuous: bool | None = None
+    txreq_delta: int | None = None
+    txok_delta: int | None = None
+    errcb_delta: int | None = None
+
+
 def finding(code: str, message: str, severity: str = "warning") -> Finding:
     return Finding(code=code, severity=severity, message=message)
 
@@ -50,20 +89,294 @@ def decode(item: ToolResult | None, model: type[DecodedData]):
         return None
 
 
-def evaluate(evidence: list[ToolResult]) -> list[Finding]:
+def _group_evidence(
+    evidence: list[ToolResult],
+) -> tuple[dict[tuple[str, str], list[ToolResult]], list[Finding]]:
     grouped: dict[tuple[str, str], list[ToolResult]] = {}
     for item in evidence:
         grouped.setdefault((item.tool, item.target), []).append(item)
-    findings = []
-    for values in grouped.values():
-        if len(values) > 1:
+    findings = [
+        finding("AMBIGUOUS_EVIDENCE", "동일 도구·대상의 중복 증거를 판정에서 제외했습니다.")
+        for values in grouped.values()
+        if len(values) > 1
+    ]
+    return grouped, findings
+
+
+def _single_result(
+    grouped: dict[tuple[str, str], list[ToolResult]], tool: str, target: str
+) -> ToolResult | None:
+    values = grouped.get((tool, target), [])
+    return values[0] if len(values) == 1 else None
+
+
+def _is_collector_unreachable(item: ToolResult | None) -> bool:
+    return (
+        item is not None
+        and isinstance(item.error, ToolError)
+        and item.error.code == "collector_unreachable"
+    )
+
+
+def _assess_live_bus(bus: ToolResult | None, findings: list[Finding]) -> None:
+    if _is_collector_unreachable(bus):
+        return
+    bus_data = decode(bus, LiveBusStateData)
+    if bus_data is None:
+        findings.append(
+            finding(
+                "LOCAL_ADAPTER_STATE_UNKNOWN",
+                "로컬 CAN 어댑터의 정상 상태를 확인하지 못했습니다.",
+            )
+        )
+        return
+    if bus_data.state == "bus_off":
+        findings.append(
+            finding("LOCAL_ADAPTER_BUS_OFF", "RPi 로컬 CAN 어댑터가 Bus-Off 상태입니다.", "error")
+        )
+    elif bus_data.state == "error_passive" or bus_data.rx_errors > 0 or bus_data.tx_errors > 0:
+        findings.append(
+            finding(
+                "LOCAL_ADAPTER_ERROR_PASSIVE",
+                "로컬 CAN 어댑터가 Error-Passive 상태이거나 송수신 오류가 관측되었습니다.",
+            )
+        )
+    elif bus_data.state == "active" and bus_data.operstate == "UP":
+        findings.append(
+            finding(
+                "LOCAL_ADAPTER_ACTIVE",
+                "로컬 CAN 어댑터가 정상 활성(ERROR-ACTIVE) 상태입니다.",
+                "info",
+            )
+        )
+    else:
+        findings.append(
+            finding(
+                "LOCAL_ADAPTER_STATE_UNKNOWN",
+                "로컬 CAN 어댑터가 UP/ERROR-ACTIVE 상태가 아닙니다.",
+            )
+        )
+
+
+def _assess_live_capture(
+    cap: ToolResult | None, spec: LiveHwTestSpecification, findings: list[Finding]
+) -> bool:
+    """Assess live CAN telemetry stream; return True if missing in observation window."""
+    if _is_collector_unreachable(cap):
+        return False
+    cap_data = decode(cap, LiveCanCaptureData)
+    if cap is None or cap.status != "ok":
+        findings.append(
+            finding(
+                "CAN_TELEMETRY_MISSING",
+                f"관측 윈도우 내 대상 CAN ID({spec.telemetry_can_id})를 수신하지 못했습니다.",
+                "error",
+            )
+        )
+        return True
+    if (
+        cap.validity == "invalid"
+        or (cap_data is not None and cap_data.magic_ok is False)
+        or (
+            cap_data is not None
+            and cap_data.valid_frame_count_in_window == 0
+            and cap_data.invalid_frame_count_in_window > 0
+        )
+    ):
+        findings.append(
+            finding(
+                "CAN_TELEMETRY_INVALID",
+                f"수신된 CAN ID({spec.telemetry_can_id}) 프레임 형식이 규약과 일치하지 않습니다.",
+                "error",
+            )
+        )
+        return False
+    if cap_data is None:
+        findings.append(
+            finding(
+                "CAN_TELEMETRY_MISSING",
+                f"CAN ID({spec.telemetry_can_id}) 디코딩 데이터가 유효하지 않습니다.",
+                "error",
+            )
+        )
+        return True
+    if cap_data.frame_count_in_window == 0:
+        findings.append(
+            finding(
+                "CAN_TELEMETRY_MISSING",
+                f"관측 윈도우 내 대상 CAN ID({spec.telemetry_can_id}) 수신 건수가 0입니다.",
+                "error",
+            )
+        )
+        return True
+    if cap.freshness == "stale" or (
+        cap_data.age_ms is not None and cap_data.age_ms > spec.telemetry_timeout_ms
+    ):
+        findings.append(
+            finding(
+                "CAN_TELEMETRY_STALE",
+                f"대상 CAN ID({spec.telemetry_can_id}) 수신이 제한 시간을 초과해 오래되었습니다.",
+            )
+        )
+        return False
+    findings.append(
+        finding(
+            "CAN_TELEMETRY_FRESH",
+            f"대상 CAN ID({spec.telemetry_can_id}) 텔레메트리가 정상 주기 내 수신 중입니다.",
+            "info",
+        )
+    )
+    if cap_data.sequence_gap_count > 0:
+        findings.append(
+            finding(
+                "CAN_SEQUENCE_GAP",
+                "연속 CAN 프레임 카운터(alive_counter) 누락 구간이 관측되었습니다.",
+            )
+        )
+    return False
+
+
+def _assess_live_uart(
+    uart: ToolResult | None,
+    spec: LiveHwTestSpecification,
+    telemetry_missing: bool,
+    findings: list[Finding],
+) -> None:
+    if _is_collector_unreachable(uart):
+        return
+    if uart is None or uart.status != "ok" or uart.validity == "invalid":
+        findings.append(
+            finding(
+                "UART_DIAGNOSTICS_UNAVAILABLE",
+                "보조 UART 진단 로그를 사용할 수 없습니다.",
+            )
+        )
+        return
+    uart_data = decode(uart, LiveUartData)
+    if uart_data is None:
+        findings.append(
+            finding(
+                "UART_DIAGNOSTICS_UNAVAILABLE",
+                "보조 UART 진단 스냅샷 형식이 유효하지 않습니다.",
+            )
+        )
+        return
+    if uart.freshness == "stale" or uart_data.sample_age_ms > spec.uart_timeout_ms:
+        findings.append(
+            finding(
+                "UART_DIAGNOSTICS_STALE",
+                "보조 UART 최근 샘플 경과시간이 기준을 초과했습니다.",
+            )
+        )
+    if uart_data.boff >= 1:
+        findings.append(
+            finding("ECU_UART_BUS_OFF", "STM32 보조 UART 상에서 Bus-Off가 관측되었습니다.", "error")
+        )
+    elif uart_data.epv >= 1:
+        findings.append(
+            finding(
+                "ECU_UART_ERROR_PASSIVE",
+                "STM32 보조 UART 상에서 Error-Passive가 관측되었습니다.",
+            )
+        )
+    if uart_data.epoch_continuous is False:
+        findings.append(
+            finding(
+                "ECU_BOOT_CHANGED",
+                "UART 타임스탬프 또는 누적 카운터가 초기화되어 ECU 재부팅이 의심됩니다.",
+            )
+        )
+        return
+    if (
+        uart_data.epoch_continuous is True
+        and uart_data.txreq_delta is not None
+        and uart_data.txok_delta is not None
+        and uart_data.errcb_delta is not None
+    ):
+        if (
+            telemetry_missing
+            and uart_data.txreq_delta > 0
+            and uart_data.txok_delta == 0
+            and uart_data.errcb_delta > 0
+        ):
             findings.append(
-                finding("AMBIGUOUS_EVIDENCE", "동일 도구·대상의 중복 증거를 판정에서 제외했습니다.")
+                finding(
+                    "UART_TX_ACTIVE_NO_CAN_RX",
+                    "STM32는 송신 요청(txreq) 중이나 txok가 멈추고 errcb가 증가해 "
+                    "CAN 배선 단선·ACK 부재 가능성이 있습니다.",
+                    "error",
+                )
+            )
+        elif uart_data.txreq_delta == 0:
+            findings.append(
+                finding(
+                    "UART_TX_STALLED",
+                    "보조 UART 기준 STM32 CAN 송신 요청(txreq)이 증가하지 않습니다.",
+                    "error",
+                )
+            )
+        elif uart_data.errcb_delta > 0:
+            findings.append(
+                finding(
+                    "UART_ACTIVE_ERRORS_INCREASING",
+                    "구간 내 STM32 CAN 오류 콜백(errcb)이 증가하고 있습니다.",
+                )
+            )
+        elif (
+            uart_data.errcb > 0
+            and uart_data.errcb_delta == 0
+            and uart_data.txok_delta > 0
+            and uart_data.tec == 0
+            and uart_data.rec == 0
+        ):
+            findings.append(
+                finding(
+                    "UART_PAST_ERROR_INACTIVE",
+                    "과거 UART 오류 카운터(errcb) 이력이 남아 있으나 현재 구간 오류 증가 없이 "
+                    "정상 송신(txok 증가, TEC=0/REC=0) 중입니다.",
+                    "info",
+                )
             )
 
+
+def evaluate_live_hw_test(
+    evidence: list[ToolResult],
+    spec: LiveHwTestSpecification = HW_TEST_SPECIFICATION,
+) -> list[Finding]:
+    """Deterministic assessment rules for Phase 1 live hw_test F103 CAN/UART evidence."""
+    grouped, findings = _group_evidence(evidence)
+    bus = _single_result(grouped, "can.bus_state", spec.can_interface)
+    cap = _single_result(grouped, "can.capture", spec.can_interface)
+    uart = _single_result(grouped, "serial.read_can_diagnostics", spec.uart_target)
+
+    present = [item for item in (bus, cap, uart) if item is not None]
+    unreachable_count = sum(1 for item in present if _is_collector_unreachable(item))
+    if unreachable_count > 0:
+        findings.append(
+            finding(
+                "COLLECTOR_UNREACHABLE",
+                "호스트 CAN/UART 수집 데몬(rpi5-hw-collector) 연결에 실패했거나 "
+                "시간이 초과되었습니다.",
+                "error",
+            )
+        )
+        if unreachable_count == len(present):
+            return findings
+
+    _assess_live_bus(bus, findings)
+    telemetry_missing = _assess_live_capture(cap, spec, findings)
+    _assess_live_uart(uart, spec, telemetry_missing, findings)
+    return findings
+
+
+def evaluate(evidence: list[ToolResult]) -> list[Finding]:
+    if any(item.source in {"live_can", "live_uart"} for item in evidence):
+        return evaluate_live_hw_test(evidence)
+
+    grouped, findings = _group_evidence(evidence)
+
     def get(tool: str, target: str) -> ToolResult | None:
-        values = grouped.get((tool, target), [])
-        return values[0] if len(values) == 1 else None
+        return _single_result(grouped, tool, target)
 
     bus = decode(get("can.bus_state", "rpi_adapter"), BusStateData)
     bus_off = bus is not None and bus.state == "bus_off"

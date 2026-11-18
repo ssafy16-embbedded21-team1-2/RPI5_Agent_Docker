@@ -16,6 +16,7 @@ from rpi5_agent.models import (
     ToolError,
     ToolResult,
 )
+from rpi5_agent.specification import FIXTURE_SPECIFICATION, HW_TEST_SPECIFICATION
 from rpi5_agent.tools.collection import EvidenceProvider, collect_evidence
 from rpi5_agent.tools.fixtures import FixtureProvider
 
@@ -65,13 +66,19 @@ def build_workflow(
         return {"findings": evaluate(state["evidence"])}
 
     def report(state: DiagnosticState) -> dict:
+        is_live = getattr(collector, "mode", "fixture") == "live"
+        prefix = "[실측 데이터]" if is_live else "[가상 데이터]"
         result = Diagnosis(
             request_id=str(uuid4()),
+            mode="live" if is_live else "fixture",
+            assessment_specification_id=(
+                HW_TEST_SPECIFICATION.id if is_live else FIXTURE_SPECIFICATION.id
+            ),
             diagnostic_profile=profile,
-            scenario=state["request"].scenario,
+            scenario=None if is_live else state["request"].scenario,
             evidence=state["evidence"],
             findings=state["findings"],
-            summary="[가상 데이터]\n관측: " + " ".join(item.message for item in state["findings"]),
+            summary=f"{prefix}\n관측: " + " ".join(item.message for item in state["findings"]),
         )
         if state["request"].use_llm:
             if summarizer is None:

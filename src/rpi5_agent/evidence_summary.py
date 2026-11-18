@@ -4,10 +4,35 @@ import json
 
 from rpi5_agent.errors import SummaryError
 from rpi5_agent.models import Finding, ToolError, ToolResult
-from rpi5_agent.specification import FIXTURE_SPECIFICATION
+from rpi5_agent.specification import FIXTURE_SPECIFICATION, HW_TEST_SPECIFICATION
 
 DATA_FIELDS = {
-    "can.bus_state": {"state", "tec", "rec"},
+    "can.bus_state": {
+        "state",
+        "tec",
+        "rec",
+        "operstate",
+        "can_state",
+        "bitrate_bps",
+        "rx_packets",
+        "tx_packets",
+        "rx_errors",
+        "tx_errors",
+        "bus_errors",
+        "rx_dropped",
+        "rx_missed",
+    },
+    "can.capture": {
+        "can_id",
+        "dlc",
+        "frame_count_in_window",
+        "valid_frame_count_in_window",
+        "invalid_frame_count_in_window",
+        "age_ms",
+        "last_alive_counter",
+        "sequence_gap_count",
+        "magic_ok",
+    },
     "gateway.snapshot": {
         "gateway_age_ms",
         "bms_age_ms",
@@ -15,6 +40,35 @@ DATA_FIELDS = {
     },
     "can.read_boot_record": {"previous_boot_id", "current_boot_id"},
     "can.read_crash_record": {"record_present", "frame_valid", "fault_kind", "stacked_pc"},
+    "serial.read_can_diagnostics": {
+        "sample_age_ms",
+        "boot_epoch",
+        "t_ms",
+        "tec",
+        "rec",
+        "lec",
+        "ewg",
+        "epv",
+        "boff",
+        "txreq",
+        "txok",
+        "txabort",
+        "txbusy",
+        "errcb",
+        "errcode",
+        "rx",
+        "last_rx_id",
+        "last_rx_dlc",
+        "epoch_continuous",
+        "interval_ms",
+        "txreq_delta",
+        "txok_delta",
+        "txabort_delta",
+        "txbusy_delta",
+        "errcb_delta",
+        "rx_delta",
+    },
+    "serial.get_identity": {"device_id", "boot_id", "firmware_build_id", "schema_version"},
 }
 
 
@@ -63,9 +117,13 @@ def build_model_payload(evidence: list[ToolResult], findings: list[Finding]) -> 
             view["error"] = item.error.model_dump(exclude_none=True)
         # Legacy free-text errors are never forwarded.
         compact.append(view)
+    is_live = any(
+        item.source in {"live_can", "live_uart", "manual_measurement"} for item in evidence
+    )
+    spec = HW_TEST_SPECIFICATION if is_live else FIXTURE_SPECIFICATION
     payload = {
-        "mode": "fixture",
-        "assessment_specification": FIXTURE_SPECIFICATION.model_dump(mode="json"),
+        "mode": "live" if is_live else "fixture",
+        "assessment_specification": spec.model_dump(mode="json"),
         "evidence": compact,
         "findings": [item.model_dump(include={"code", "message"}) for item in findings],
     }

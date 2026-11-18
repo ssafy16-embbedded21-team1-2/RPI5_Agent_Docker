@@ -13,6 +13,11 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       DIAGNOSTIC_PROFILE: ${DIAGNOSTIC_PROFILE:-product}
+      EVIDENCE_PROVIDER: ${EVIDENCE_PROVIDER:-fixture}
+      COLLECTOR_BASE_URL: ${COLLECTOR_BASE_URL:-http://host.docker.internal:8090}
+      COLLECTOR_TIMEOUT_SECONDS: ${COLLECTOR_TIMEOUT_SECONDS:-3.0}
+      COLLECTOR_CAN_INTERFACE: ${COLLECTOR_CAN_INTERFACE:-can0}
+      COLLECTOR_UART_TARGET: ${COLLECTOR_UART_TARGET:-hw_test_f103}
       LLM_ENABLED: ${LLM_ENABLED:-false}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8080/v1}
       LLM_MODEL: ${LLM_MODEL:-local-qwen}

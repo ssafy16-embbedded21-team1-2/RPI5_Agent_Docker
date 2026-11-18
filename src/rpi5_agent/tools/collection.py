@@ -7,11 +7,14 @@ from rpi5_agent.models import DiagnosticProfile, Scenario, ToolCall, ToolError, 
 PRODUCT_READ_TOOLS = frozenset(
     {
         "can.bus_state",
+        "can.capture",
         "gateway.snapshot",
         "can.get_identity",
         "can.check_dtc",
         "can.read_boot_record",
         "can.read_crash_record",
+        "serial.read_can_diagnostics",
+        "serial.get_identity",
         "analyze.symbols",
     }
 )
