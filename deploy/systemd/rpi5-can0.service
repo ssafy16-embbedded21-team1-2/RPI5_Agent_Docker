@@ -1,0 +1,12 @@
+[Unit]
+Description=Bring up RPi5 can0 interface (500 kbit/s, non-fatal if absent)
+After=systemd-modules-load.service local-fs.target
+Before=rpi5-hw-collector.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/setup_rpi5_can0.sh
+
+[Install]
+WantedBy=multi-user.target
