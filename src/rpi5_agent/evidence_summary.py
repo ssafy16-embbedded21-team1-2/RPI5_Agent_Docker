@@ -125,7 +125,7 @@ def build_model_payload(evidence: list[ToolResult], findings: list[Finding]) -> 
         "mode": "live" if is_live else "fixture",
         "assessment_specification": spec.model_dump(mode="json"),
         "evidence": compact,
-        "findings": [item.model_dump(include={"code", "message"}) for item in findings],
+        "findings": [item.model_dump(include={"code", "severity", "message"}) for item in findings],
     }
     # A byte cap is a guard against accidental large inputs, not a token guarantee.
     if len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode()) > 6000:

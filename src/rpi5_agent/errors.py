@@ -9,8 +9,10 @@ class SummaryError(ValueError):
         code: str,
         metadata: LLMMetadata | None = None,
         routing: LLMRouting | None = None,
+        error_detail: str | None = None,
     ):
         super().__init__(code)
         self.code = code
         self.metadata = metadata
         self.routing = routing
+        self.error_detail = error_detail

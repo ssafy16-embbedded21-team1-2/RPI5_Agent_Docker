@@ -100,6 +100,7 @@ def build_workflow(
                 result.llm_status = "unavailable"
                 if isinstance(exc, SummaryError):
                     result.llm_error = exc.code
+                    result.llm_error_detail = exc.error_detail
                     result.llm_metadata = exc.metadata
                     result.llm_routing = exc.routing
                 else:

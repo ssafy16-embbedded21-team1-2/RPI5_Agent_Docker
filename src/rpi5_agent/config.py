@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     external_llm_max_tokens: int = Field(default=4096, ge=1, le=8192)
     external_llm_response_format: Literal["prompt", "json_object", "json_schema"] = "prompt"
     external_llm_fallback_on_local_failure: bool = True
+    auto_prefer_external_for_warnings: bool = True
 
     @field_validator("llm_base_url", "external_llm_base_url", "collector_base_url")
     @classmethod

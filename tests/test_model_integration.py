@@ -225,8 +225,8 @@ def diagnose_with_routing(settings, **kwargs):
 @pytest.mark.parametrize(
     ("scenario", "target", "backend", "reason"),
     [
-        ("healthy", "auto", "local", "local_default"),
-        ("bms_timeout", "auto", "local", "local_default"),
+        ("healthy", "auto", "template", "deterministic_template"),
+        ("bms_timeout", "auto", "pamout", "warning_findings"),
         ("bus_off", "auto", "pamout", "error_findings"),
         ("bus_off", "local", "local", "explicit_local"),
         ("bms_timeout", "external", "pamout", "explicit_external"),
@@ -245,7 +245,19 @@ def test_routing_uses_explicit_target_or_deterministic_findings(
     assert result["llm_routing"]["backend"] == backend
     assert result["llm_routing"]["reason"] == reason
     assert result["llm_routing"]["requested"] == target
-    assert len(result["llm_routing"]["attempts"]) == 1
+    if backend == "template":
+        assert result["llm_routing"]["attempts"] == []
+        assert result["explanation"] == {
+            "hypothesis": "모든 진단 항목이 정상 범위 내에 있습니다.",
+            "next_check": "추가 조치 없이 주기적 상태 감시를 유지하세요.",
+        }
+        assert result["llm_metadata"] == {
+            "finish_reason": "stop",
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    else:
+        assert len(result["llm_routing"]["attempts"]) == 1
     assert len(local_requests) == (1 if backend == "local" else 0)
     assert len(external_requests) == (1 if backend == "pamout" else 0)
     if backend == "pamout":
@@ -271,7 +283,9 @@ def test_auto_escalates_local_failure_once_and_records_both_attempts(model_serve
         local_reply["finish_reason"] = "length"
     else:
         local_reply["http_status"] = 500
-    result, fallback = diagnose_with_routing(routed_settings(local_url, external_url))
+    result, fallback = diagnose_with_routing(
+        routed_settings(local_url, external_url, auto_prefer_external_for_warnings=False)
+    )
     assert result["findings"] == fallback["findings"]
     assert result["llm_status"] == "generated"
     assert result["llm_error"] is None
@@ -289,7 +303,10 @@ def test_local_only_or_disabled_escalation_never_calls_external(model_servers, t
     external_url, external_requests, _ = model_servers()
     local_reply["content"] = "not JSON"
     settings = routed_settings(
-        local_url, external_url, external_llm_fallback_on_local_failure=False
+        local_url,
+        external_url,
+        external_llm_fallback_on_local_failure=False,
+        auto_prefer_external_for_warnings=False,
     )
     result, fallback = diagnose_with_routing(settings, llm_target=target)
     assert result["llm_status"] == "unavailable"
@@ -369,7 +386,12 @@ def test_local_timeout_escalates_without_sdk_retry(model_servers):
     external_url, external_requests, _ = model_servers()
     local_reply["delay_seconds"] = 0.3
     result, _ = diagnose_with_routing(
-        routed_settings(local_url, external_url, llm_timeout_seconds=0.05)
+        routed_settings(
+            local_url,
+            external_url,
+            llm_timeout_seconds=0.05,
+            auto_prefer_external_for_warnings=False,
+        )
     )
     assert result["llm_status"] == "generated"
     assert "Timeout" in result["llm_routing"]["attempts"][0]["error"]
@@ -396,7 +418,9 @@ def test_both_backends_failing_keep_both_attempts_and_code_generated_summary(mod
     external_url, external_requests, reply = model_servers()
     local_reply["finish_reason"] = "length"
     reply["http_status"] = 500
-    result, fallback = diagnose_with_routing(routed_settings(local_url, external_url))
+    result, fallback = diagnose_with_routing(
+        routed_settings(local_url, external_url, auto_prefer_external_for_warnings=False)
+    )
     assert result["llm_status"] == "unavailable"
     assert result["summary"] == fallback["summary"]
     assert result["llm_routing"]["reason"] == "local_failure"
@@ -430,3 +454,80 @@ def test_record_context_reaches_model_without_debug_commands_or_raw_dump(model_s
     assert record["running_build_id"] == "firmware-current"
     symbols = next(item for item in evidence if item["tool"] == "analyze.symbols")
     assert symbols["error"]["code"] == "symbol_build_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "bad_explanation", "expected_violation"),
+    [
+        (
+            "bms_timeout",
+            {
+                "hypothesis": (
+                    "STM32 보조 UART의 보호 해제 상태로 인해 Error-Passive가 발생했습니다."
+                ),
+                "next_check": "STM32 보조 UART의 보호 해제 상태 확인 및 해제",
+            },
+            "semantic_violation:forbidden_control_action",
+        ),
+        (
+            "healthy",
+            {
+                "hypothesis": "게이트웨이와 BMS 갱신이 불완전하여 고장이 발생했습니다.",
+                "next_check": "배선 상태를 점검하세요.",
+            },
+            "semantic_violation:healthy_contradiction",
+        ),
+        (
+            "crash_recorded",
+            {
+                "hypothesis": "현재 ECU 고장이 발생하여 시스템이 멈췄습니다.",
+                "next_check": "과거 크래시 기록의 빌드를 확인하세요.",
+            },
+            "semantic_violation:historical_crash_as_current",
+        ),
+        (
+            "symbols_missing",
+            {
+                "hypothesis": "main.c:42에서 하드폴트가 발생했을 가능성이 있습니다.",
+                "next_check": "기록된 빌드의 ELF 심벌을 확보하세요.",
+            },
+            "semantic_violation:unverified_symbol_claim",
+        ),
+    ],
+)
+def test_semantic_guardrail_rejects_forbidden_actions_and_contradictions(
+    model_server, scenario, bad_explanation, expected_violation
+):
+    base_url, _, reply = model_server
+    reply["content"] = json.dumps(bad_explanation, ensure_ascii=False)
+    settings = Settings(_env_file=None, llm_enabled=True, llm_base_url=base_url)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/diagnose",
+            json={"scenario": scenario, "use_llm": True, "llm_target": "local"},
+        )
+    result = response.json()
+    assert result["llm_status"] == "unavailable"
+    assert result["llm_error"] == "invalid_model_output"
+    assert result["llm_error_detail"] == expected_violation
+    assert result["explanation"] is None
+    assert result["llm_routing"]["attempts"][0]["error_detail"] == expected_violation
+
+
+def test_validation_error_detail_is_sanitized_and_observable(model_server):
+    base_url, _, reply = model_server
+    too_long = "가" * 51
+    reply["content"] = json.dumps(
+        {"hypothesis": too_long, "next_check": "배선을 점검하세요."}, ensure_ascii=False
+    )
+    settings = Settings(_env_file=None, llm_enabled=True, llm_base_url=base_url)
+    with TestClient(create_app(settings)) as client:
+        response = client.post("/diagnose", json={"scenario": "bms_timeout", "use_llm": True})
+    result = response.json()
+    assert result["llm_status"] == "unavailable"
+    assert result["llm_error"] == "invalid_model_output"
+    assert result["llm_error_detail"] == "field=hypothesis,type=string_too_long,len=51"
+    assert result["llm_routing"]["attempts"][0]["error_detail"] == (
+        "field=hypothesis,type=string_too_long,len=51"
+    )
+    assert too_long not in json.dumps(result, ensure_ascii=False)

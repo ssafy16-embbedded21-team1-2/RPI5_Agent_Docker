@@ -145,15 +145,22 @@ class LLMAttempt(BaseModel):
     model: str
     status: Literal["generated", "unavailable"]
     error: str | None = None
+    error_detail: str | None = None
     metadata: LLMMetadata | None = None
 
 
 class LLMRouting(BaseModel):
     requested: LLMTarget
-    backend: Literal["local", "pamout"]
+    backend: Literal["local", "pamout", "template"]
     model: str
     reason: Literal[
-        "explicit_local", "explicit_external", "error_findings", "local_default", "local_failure"
+        "explicit_local",
+        "explicit_external",
+        "error_findings",
+        "warning_findings",
+        "local_default",
+        "local_failure",
+        "deterministic_template",
     ]
     attempts: list[LLMAttempt] = Field(default_factory=list)
 
@@ -176,6 +183,7 @@ class Diagnosis(BaseModel):
     summary: str
     llm_status: Literal["disabled", "generated", "unavailable"] = "disabled"
     llm_error: str | None = None
+    llm_error_detail: str | None = None
     explanation: ModelExplanation | None = None
     llm_metadata: LLMMetadata | None = None
     llm_routing: LLMRouting | None = None
