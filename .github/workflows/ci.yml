@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: Ruff & Pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python (.python-version)
+        run: uv python install
+
+      - name: Sync dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Run Ruff lint
+        run: uv run --frozen ruff check .
+
+      - name: Run Ruff format check
+        run: uv run --frozen ruff format --check .
+
+      - name: Run Pytest
+        run: uv run --frozen pytest -q
