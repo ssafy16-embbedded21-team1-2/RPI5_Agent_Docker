@@ -237,15 +237,15 @@ Phase 1 파일럿(`src/rpi5_agent/hw_collector.py`, `scripts/run_hw_collector.py
 | ----------- | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `0x01`      | `IDENTITY_BOOT`    | B2\~3: `boot_counter` (`uint16`), B4: `reset_reason_flags` (`uint8`), B5\~6: `fw_build_tag` (`uint16`), B7: `capabilities` (`uint8`)                 | 재부팅 여부(와치독/전원 차단)와 Sequence 초기화 구분                  |
 | `0x02`      | `CAN_HEALTH`       | B2: `tec` (`uint8`), B3: `rec` (`uint8`), B4: `lec_last` (`uint8`), B5: `tx_err_cnt_sat` (`uint8`), B6\~7: `last_cmd_age_10ms` (`uint16`, 10ms 단위) | UART 없이 CAN 버스 상에서 보드 B의 TEC/REC·명령 수신 경과시간 조회    |
-| `0x03`      | `FAN_HW_SELFCHECK` | B2\~3: `target_rpm_or_duty` (`uint16`), B4\~5: `measured_rpm` (`uint16`), B6: `hall_pulse_ok` (`uint8`), B7: `driver_enable` (`uint8`)               | `NO_ROTATION`/`RPM_DEVIATION` 발생 시 구동 출력 vs 홀센서 피드백 분리 |
+| `0x03`      | `FAN_HW_SELFCHECK` | B2\~3: `target_rpm_or_duty` (`uint16`), B4\~5: `measured_rpm` (`uint16`), B6: `hall_pulse_ok` (`uint8`), B7: `driver_enable` (`uint8`)               | `NO_ROTATION`/`RPM_DEVIATION` 발생 시 구동 출력 vs 홀센서 피드백 분리 (`target_rpm_or_duty` 단위는 `PJT-20` `A_FAN_CMD` 목표 듀티 기준 통일 여부 협의) |
 
-### 5-2. `PJT-16` / 차기 회의에서 확정할 체크리스트
+### 5-2. `PJT-16` · `PJT-20` / 차기 회의에서 확정할 체크리스트 (2026-11-18 갱신)
 
-1. **CAN ID 배정**: `0x1~`/`0x2~` 규칙 vs 우선순위(3)/장치(2)/기능(6) 비트 규칙 확정 및 `B_FAN_STATUS`, `B_FAN_FAULT`, `B_DIAG_RESP`, `A_FAN_CMD`, `DIAG_REQ` 최종 ID 표 작성.
-2. **통신 속도 · 임계치**: Classic CAN `500 kbit/s` 공식 확정, `B_FAN_STATUS` stale 기준(예: 500ms), `NO_ROTATION` 판정 시간, `RPM_DEVIATION` 허용 오차(%).
-3. **보드 A(열관리 제어기) 명세**: 보드 A가 송신하는 온도/제어 명령 메시지 ID 및 바이트 배치.
-4. **보조 UART 유지 여부**: 양산형 보드 A/B 펌웨어에서도 디버그용 UART 상태 출력(텍스트 또는 셋업 레포 `docs/CAN_현장_통신불량_진단_시나리오_설계.md` 5절 JSON)을 유지할지 결정.
-5. **저장소 연계**: `aide-ecu` 레포의 `common/` 메시지 정의(또는 DBC/YAML)를 `RPI5_Agent_Docker`가 어떤 버전 단위로 동기화할지 결정 (`edge_ai/` 합병 vs 별도 레포 + 명세 파일 공유).
+1. **CAN ID 배정 (`PJT-16` 댓글 `10011` 수정 반영)**: 비트필드 계산식 `ID = (우선순위 × 256) + (장치번호 × 64) + 기능번호` (`우선순위 bit 10~8`, 예시 `0x240`) 기준으로 `B_FAN_STATUS`, `B_FAN_FAULT`, `B_DIAG_RESP`, `DIAG_REQ` 최종 ID 확정 (`PJT-20` 보드 A 초안: `A_FAN_CMD=0x080`, `A_THERMAL_STATUS=0x180`, `B_FAN_STATUS=0x1C0`, `진단=0x380/0x300`).
+2. **진단 프로토콜 방식 통일**: `PJT-16`(`10011`)의 8B 단일 프레임 `DIAG_REQ`/`B_DIAG_RESP`(`0x01~0x03`)와 `PJT-20`의 `0x380/0x300 (UDS + ISO-TP)` 중 최종 채택 방식 및 엔디안 통일.
+3. **통신 속도 · 임계치**: Classic CAN `500 kbit/s` 확정, `B_FAN_STATUS` stale 기준(예: `500 ms`), `NO_ROTATION` 판정 시간, `RPM_DEVIATION` 허용 오차(%) 확정 (보드 B 실측 후 제안 예정).
+4. **단위 정합성**: `FAN_HW_SELFCHECK`의 `target_rpm_or_duty`를 `PJT-20` `A_FAN_CMD`의 목표 듀티(`%`)와 맞출지 RPM으로 할지 확정.
+5. **보조 UART 및 저장소 연계**: 양산형 보드 A/B 펌웨어의 디버그용 UART 유지 여부와 [`aide-ecu`](https://github.com/ssafy16-embbedded21-team1-2/aide-ecu) `common/` 명세를 `RPI5_Agent_Docker`와 어떤 버전 단위로 동기화할지 결정.
 
 ---
 
