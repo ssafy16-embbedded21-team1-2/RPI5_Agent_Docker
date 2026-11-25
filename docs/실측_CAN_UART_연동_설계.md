@@ -1,9 +1,9 @@
-# RPI5_Agent_Docker 실측 CAN · UART 연동 설계서 (v0.1)
+# RPI5_Agent_Docker 실측 CAN · UART 연동 설계서 (v0.2)
 
-작성일: 2026-11-17 KST. 상태: **Phase 1 파일럿 코드 구현 및 PC 단위·통합 테스트 완료 (Phase 2 본 규약 연동은 구현 전 설계)**.
+작성일: 2026-11-17 KST (2026-11-25 `PJT-19`·`PJT-20` 보드 A 명세 및 Phase 2 수동 주기 코덱 반영). 상태: **Phase 1 실측 파일럿(`hw-test-f103-v1`) 완료 + Phase 2 수동 주기 CAN 디코더·판정(`aide-ecu-v1`: `0x080`/`0x180`/`0x1C0`) 구현 및 PC 테스트 완료 (`DIAG_REQ`/UDS·DID 능동 진단은 팀 협의 대기)**.
 
 **주의: 기본 런타임 설정은 `EVIDENCE_PROVIDER=fixture`(`mode="fixture"`, `physical_collection=false`)로 유지됩니다.**
-Phase 1 파일럿(`src/rpi5_agent/hw_collector.py`, `scripts/run_hw_collector.py`, `src/rpi5_agent/tools/live_provider.py`, `evaluate_live_hw_test`, `HW_TEST_SPECIFICATION` `hw-test-f103-v1`, `tests/test_live_phase1.py`)은 PC 테스트(`161 passed`)까지 완료됐으며, `EVIDENCE_PROVIDER=http_collector`로 활성화합니다. 현재 `pi32` 실기기는 `can0`·STM32 물리 연결이 분리된 상태이므로, RPi 5 실기기 파일럿 연동 검증은 하드웨어 재연결 후 수행합니다. 기존 `fixture-bench-v1` 가상 검증 13종은 그대로 보존됩니다.
+Phase 1(`LIVE_SPECIFICATION=hw_test_f103`)과 Phase 2 보드 A·B 수동 주기 수신(`LIVE_SPECIFICATION=aide_ecu`)은 `EVIDENCE_PROVIDER=http_collector`로 활성화합니다. 현재 `pi32` 실기기는 `can0`·STM32 물리 연결이 분리된 상태이므로, 2-보드 실기기 E2E 검증은 보드 A·B 통합 연결 후 수행합니다. 기존 `fixture-bench-v1` 가상 검증 13종은 그대로 보존됩니다.
 
 ## 0. 선행 실기기 검증 근거 (2026-11-17, `PJT-17` 완료)
 
@@ -179,16 +179,31 @@ Phase 1 파일럿(`src/rpi5_agent/hw_collector.py`, `scripts/run_hw_collector.py
 
 ### Phase 2: 보드 A(열관리 제어기) · 보드 B(스마트 냉각팬 ECU) 본 규약 연동
 
-임베디드 파트가 `보드 B(스마트 냉각팬 ECU) CAN 메시지 명세서 (초안)`과 보드 A 명세를 확정한 뒤, 설정 기반 코덱을 연결합니다.
+`PJT-19`(`보드A_기능명세서.pdf`, 2026-11-18 초안 r1) 및 `PJT-20`(`board_a_can_packet.pdf`, 2026-11-24 완료)에 정의된 **수동 주기 수신 프레임 3종과 상태·고장 규약**을 [`aide-ecu-v1`](../src/rpi5_agent/specification.py) 명세로 구현했습니다. 능동 진단 프레임(`DIAG_REQ` / `A_DIAG_RESP` / `B_DIAG_RESP`)만 팀 협의 확정 후 추가합니다.
 
-- **보드 B 수신 메시지 디코더 초안** (리틀 엔디안, 최종 CAN ID는 설정 주입):
-  - `B_FAN_STATUS` (100ms, DLC 8): `fan_rpm` (`uint16`, B0\~1), `duty_actual` (`uint8`, B2, 0\~100%), `fan_state` (`uint8`, B3: `0=INIT`, `1=STOP`, `2=RUN`, `3=FAULT`, `4=TEST`), `fault_code` (`uint8`, B4: `0x00=NONE`, `0x01=NO_ROTATION`, `0x02=RPM_DEVIATION`, `0x03=CMD_TIMEOUT`), `alive_cnt` (`uint8`, B7).
-  - `B_FAN_FAULT` (이벤트, DLC 8): `fault_code` (`uint8`, B0), `rpm_at_fault` (`uint16`, B1\~2), `duty_at_fault` (`uint8`, B3), `fault_count` (`uint8`, B4).
-  - `B_DIAG_RESP` (응답, DLC 8): `diag_item` (`uint8`, B0), `result` (`uint8`, B1: `0=정상`, `1=이상`, `2=지원 안 함`), 상세값(B2\~7).
-- **고장 시나리오 연동**:
-  - `B_FAN_STATUS` 미수신 또는 `alive_cnt` 정체 시 보드 B 생존/통신 단절 판정(종전 `gateway_timeout` 대체).
-  - `fan_state == 4 (TEST)` 수신 시 실제 현장 고장이 아닌 고장 주입 시험 모드(`FAN_TEST_MODE_ACTIVE`)로 명시 구분.
-  - 보드 A 메시지(`A_FAN_CMD` 등)가 확정되면 "보드 A 명령 송신 유무 vs 보드 B `fault_code=0x03 (CMD_TIMEOUT)`" 교차 판정을 추가합니다.
+#### 1) 보드 A 하드웨어·제어·상태·고장 명세 (`PJT-19` 반영)
+
+- **센서·주변장치 구성 (`aide-ecu/board_a/board_a.ioc` 핀맵 일치)**:
+  - 주변 온도 `BMP280` (주소 `0x76`, `chip id 0x58`) + 팬 진동 `MPU6050` 호환 칩 (주소 `0x68`, `WHO_AM_I 0x72`, 가속도 RMS만 사용) — `I2C1` 리맵 `PB8(SCL)`/`PB9(SDA)` 공유, SDA 분리 시 F103 I2C 잠김 복구 절차 포함(실측 `3.1 s`).
+  - `bxCAN`: `PA11(RX)`/`PA12(TX)` (`500 kbps`, `Prescaler=4, BS1=15TQ, BS2=2TQ`, 샘플 포인트 `88.9%`), `USART2`: `PA2/PA3` (`115200 bps` VCP), 상태 LED `LD2(PA5)`.
+- **온도별 목표 듀티 표 (예시) 및 제어/감시 상태 분리**:
+  - `35 °C` 미만 `0%`(정상) / `35~45 °C` `30→70%`(정상) / `45~55 °C` `70→100%`(경고) / `55 °C` 이상 `100%`(과온 — 고장이 아닌 열관리 상태로만 보고).
+  - 제어 모드(`a_state`: `0=INIT`, `1=NORMAL`, `2=FAILSAFE` 온도 불명 시 팬 `100%` 명령, `3=TEST`)와 냉각팬 감시(`OK`, `COMM_LOST`, `RESP_FAULT`)를 독립 판정합니다.
+
+#### 2) CAN 주기 메시지 디코더 (`PJT-20` 반영, Standard 11-bit, DLC 8, Little Endian)
+
+- **`A_FAN_CMD` (`0x080`, A → B, 100 ms, 수신 타임아웃 300 ms)**:
+  - `B0`: `duty_target` (`uint8`, `0~100%`, `>100` 또는 `DLC!=8` 무효 처리), `B1~6`: 예약(`0`), `B7`: `alive_cnt` (`uint8`).
+- **`A_THERMAL_STATUS` (`0x180`, A → B·RPi, 100 ms, stale 기준 500 ms)**:
+  - `B0~1`: `temp_ambient` (`sint16 LE`, `0.1 °C`, 무효 `0x7FFF`), `B2`: `duty_target` (`uint8`, `0~100%`), `B3~4`: `vib_rms` (`uint16 LE`, `1 mg`, 무효 `0xFFFF`), `B5[3:0]`: `a_state` (`0~3`), `B5[7:4]`: `thermal_state` (`0=정상`, `1=경고`, `2=과온`, `3=불명`), `B6`: `fault_flags` (비트 `n-1` = 고장 코드 `n`: `0x01 TEMP_SENSOR`, `0x02 VIB_SENSOR`, `0x03 FAN_STATUS_TIMEOUT`, `0x04 FAN_FAULT_REPORTED`, `0x05 FAN_DUTY_MISMATCH`, 후보 `0x06 CAN_BUS_OFF`, `0x07 TASK_OVERRUN`), `B7`: `alive_cnt`.
+- **`B_FAN_STATUS` (`0x1C0`, B → A·RPi, 100 ms, stale 기준 500 ms)**:
+  - `B0~1`: `fan_rpm` (`uint16 LE`), `B2`: `duty_actual` (`uint8`, `0~100%`), `B3`: `fan_state` (`0=INIT`, `1=STOP`, `2=RUN`, `3=FAULT`, `4=TEST`), `B4`: `fault_code` (`0x00=NONE`, `0x01=NO_ROTATION`, `0x02=RPM_DEVIATION`, `0x03=CMD_TIMEOUT`; `AIDE_B_FAULT_ENCODING=code|bitmask` 설정으로 양쪽 형식 대응), `B7`: `alive_cnt`.
+- **`alive_cnt` 누락 vs 정지 분리 (`hw_collector.py`)**:
+  - 값이 건너뛰면 `sequence_gap_count`를 누적(`warning`)하고, 연속 동일 값 반복은 `consecutive_frozen_count`로 별도 집계해 기준(`3회`) 이상 시 `<STREAM>_ALIVE_FROZEN` (`error`, 송신 ECU 정지 의심)으로 판정합니다.
+- **3-노드 버스 교차 판정 (`evaluate_live_aide_ecu`)**:
+  - 로컬 어댑터가 `ERROR-ACTIVE`·`UP`이 아니면 `REMOTE_STATE_UNKNOWN`을 기록하고 원격 미수신 오탐을 차단합니다.
+  - 보드 B `CMD_TIMEOUT` 수신 시 RPi의 `A_FAN_CMD` 정상 수신 여부에 따라 `CROSS_BOARD_A_CMD_ABSENT_CONFIRMED` vs `CROSS_BOARD_B_RX_PATH_SUSPECTED`로, 보드 A `FAN_STATUS_TIMEOUT` 수신 시 RPi의 `B_FAN_STATUS` 수신 여부에 따라 `CROSS_BOARD_B_STATUS_ABSENT_CONFIRMED` vs `CROSS_BOARD_A_RX_PATH_SUSPECTED`로 경로를 분리합니다.
+  - `a_state == 3` / `fan_state == 4` 수신 시 시험 모드(`BOARD_A_TEST_MODE_ACTIVE`, `FAN_TEST_MODE_ACTIVE`, `info`)로 분리하며, 모든 Finding이 `info`인 정상 운전 시 `RoutedSummarizer(auto)`는 0토큰 `deterministic_template`을 반환합니다.
 
 ---
 
@@ -200,10 +215,10 @@ Phase 1 파일럿(`src/rpi5_agent/hw_collector.py`, `scripts/run_hw_collector.py
 | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [`models.py`](../src/rpi5_agent/models.py)                                        | `source="fixture"`, `mode="fixture"`, 고정 13종 `Scenario`             | • `ToolResult.source`: `"fixture" \| "live_can" \| "live_uart" \| "manual_measurement"`<br>• `ToolResult.transport`: 기존 + `"socketcan" \| "uart_text" \| "uart_json"`<br>• `Diagnosis.mode`: `"fixture" \| "live"`<br>• 실측용 `DiagnoseRequest`에 대상 프로파일/모드 구분(또는 별도 `/diagnose/live` 분리 검토) |
 | [`tools/collection.py`](../src/rpi5_agent/tools/collection.py)                    | `PRODUCT_READ_TOOLS`에 `can.*` 6종 + `analyze.symbols`                 | • 실측 읽기 도구 추가: `can.capture`, `serial.read_can_diagnostics`, `serial.get_identity`<br>• `HttpHardwareProvider` 구현 (단일 타임아웃, 재시도 없음, 연결 실패 시 `collector_unreachable` / `serial_unavailable` 반환)                                                                                         |
-| [`specification.py`](../src/rpi5_agent/specification.py)                          | `FIXTURE_SPECIFICATION` (`fixture-bench-v1`) 단일 상수                 | • `FIXTURE_SPECIFICATION` 보존<br>• `HW_TEST_SPECIFICATION` (`hw-test-f103-v1`: `0x100` stale 500ms, UART stale 2500ms) 및 `AIDE_ECU_SPECIFICATION` (`aide-ecu-v1`, 외부 YAML/JSON 설정 로드) 추가                                                                                                                 |
-| [`assessment.py`](../src/rpi5_agent/assessment.py)                                | `can.bus_state("rpi_adapter")` + `gateway.snapshot("cell1")` 고정 판정 | • 기존 `evaluate()`는 `fixture` 전용 또는 `evaluate_fixture()`로 보존<br>• 실측용 `evaluate_live_hw_test()` / `evaluate_live_aide()` 분기 (명세 ID별 판정 함수 분리, 아래 Finding 표 참고)                                                                                                                         |
-| [`evidence_summary.py`](../src/rpi5_agent/evidence_summary.py)                    | `DATA_FIELDS`에 4개 가상 도구만 허용                                   | • `can.bus_state`에 `rx_errors`, `tx_errors`, `bus_errors` 추가<br>• `can.capture`, `serial.read_can_diagnostics`의 허용 스칼라 필드만 화이트리스트 등록 (원시 로그 문자열·hex 덤프 차단, 6,000B 가드 유지)                                                                                                        |
-| [`config.py`](../src/rpi5_agent/config.py) & [`api.py`](../src/rpi5_agent/api.py) | `provider=None` 고정, `mode="fixture"` 하드코딩                        | • `EVIDENCE_PROVIDER=fixture\|http_collector`, `COLLECTOR_BASE_URL`, `COLLECTOR_TIMEOUT_SECONDS` 추가<br>• `/health`, `/capabilities`가 `mode`와 `physical_collection`을 실제 provider에 맞춰 반환 (실측 모드에서 `/verify`는 409 유지)                                                                            |
+| [`specification.py`](../src/rpi5_agent/specification.py) | `FIXTURE_SPECIFICATION` · `HW_TEST_SPECIFICATION` · `AIDE_ECU_SPECIFICATION` | • `LIVE_SPECIFICATION=aide_ecu` (`aide-ecu-v1`) 및 `AIDE_B_FAULT_ENCODING` 설정 지원 |
+| [`assessment.py`](../src/rpi5_agent/assessment.py) | `evaluate_fixture`, `evaluate_live_hw_test`, `evaluate_live_aide_ecu` 분기 | • Phase 2 `0x080`/`0x180`/`0x1C0` 상태·고장·3-노드 교차 판정 구현 (아래 Finding 표 참고) |
+| [`evidence_summary.py`](../src/rpi5_agent/evidence_summary.py) | `can.capture`·`serial.read_can_diagnostics` 허용 스칼라 화이트리스트 | • 보드 A·B 디코딩 스칼라 필드(`temp_degc`, `vib_rms_mg`, `a_state`, `fault_flags`, `fan_rpm`, `duty_actual`, `fan_state`, `fault_code`, `consecutive_frozen_count`) 및 6,000B 가드 유지 |
+| [`config.py`](../src/rpi5_agent/config.py) & [`api.py`](../src/rpi5_agent/api.py) | `EVIDENCE_PROVIDER=fixture\|http_collector`, `LIVE_SPECIFICATION=hw_test_f103\|aide_ecu` | • `/health`, `/capabilities`, `/diagnose`가 선택된 Phase 1/2 명세 ID와 `mode="live"` 반환 (`/verify`는 409 유지) |
 
 ### 실측용 Finding 코드 초안
 
@@ -220,8 +235,12 @@ Phase 1 파일럿(`src/rpi5_agent/hw_collector.py`, `scripts/run_hw_collector.py
 | `UART_TX_ACTIVE_NO_CAN_RX`                                | `error`   | `CAN_TELEMETRY_MISSING`이면서 UART `txreq_delta > 0`, `txok_delta == 0`, `errcb_delta > 0` |
 | `UART_TX_STALLED`                                         | `error`   | UART 응답은 정상이지만 `txreq_delta == 0`                                                  |
 | `UART_PAST_ERROR_INACTIVE`                                | `info`    | `errcb > 0`이지만 `errcb_delta == 0` 및 `txok_delta > 0`, `TEC == 0`, `REC == 0`           |
-| `FAN_FAULT_NO_ROTATION` / `RPM_DEVIATION` / `CMD_TIMEOUT` | `error`   | Phase 2 보드 B `fault_code` (`0x01`/`0x02`/`0x03`) 수신                                    |
-| `FAN_TEST_MODE_ACTIVE`                                    | `info`    | Phase 2 보드 B `fan_state == 4 (TEST)` 수신                                                |
+| `FAN_FAULT_NO_ROTATION` / `RPM_DEVIATION` / `CMD_TIMEOUT` | `error`   | Phase 2 보드 B `fault_code` (`0x01`/`0x02`/`0x03`, 또는 bitmask) 수신 |
+| `BOARD_A_FAILSAFE_ACTIVE` / `BOARD_A_FAULT_*`             | `error` / `warning` | Phase 2 보드 A `a_state=2` 또는 `fault_flags` (`0x01`\~`0x07`) 수신 |
+| `THERMAL_STATE_WARNING` / `THERMAL_STATE_OVER_TEMP`       | `warning` | 보드 A `thermal_state` 경고(`45~55°C`)/과온(`55°C` 이상) — 센서 고장과 분리 |
+| `<STREAM>_ALIVE_FROZEN`                                   | `error`   | `0x080`/`0x180`/`0x1C0` `alive_cnt` 3회 이상 연속 동일 값 정지 |
+| `CROSS_BOARD_*_ABSENT_CONFIRMED` / `*_RX_PATH_SUSPECTED`  | `error`   | RPi 직접 CAN 수신 여부와 상대 보드의 타임아웃 보고(`0x03`/`0x04`) 교차 판정 |
+| `BOARD_A_TEST_MODE_ACTIVE` / `FAN_TEST_MODE_ACTIVE`       | `info`    | Phase 2 `a_state == 3` 또는 `fan_state == 4 (TEST)` 수신 |
 
 ---
 
@@ -239,13 +258,14 @@ Phase 1 파일럿(`src/rpi5_agent/hw_collector.py`, `scripts/run_hw_collector.py
 | `0x02`      | `CAN_HEALTH`       | B2: `tec` (`uint8`), B3: `rec` (`uint8`), B4: `lec_last` (`uint8`), B5: `tx_err_cnt_sat` (`uint8`), B6\~7: `last_cmd_age_10ms` (`uint16`, 10ms 단위) | UART 없이 CAN 버스 상에서 보드 B의 TEC/REC·명령 수신 경과시간 조회    |
 | `0x03`      | `FAN_HW_SELFCHECK` | B2\~3: `target_rpm_or_duty` (`uint16`), B4\~5: `measured_rpm` (`uint16`), B6: `hall_pulse_ok` (`uint8`), B7: `driver_enable` (`uint8`)               | `NO_ROTATION`/`RPM_DEVIATION` 발생 시 구동 출력 vs 홀센서 피드백 분리 (`target_rpm_or_duty` 단위는 `PJT-20` `A_FAN_CMD` 목표 듀티 기준 통일 여부 협의) |
 
-### 5-2. `PJT-16` · `PJT-20` / 차기 회의에서 확정할 체크리스트 (2026-11-18 갱신)
+### 5-2. `PJT-16` · `PJT-19` · `PJT-20` 차기 회의 확정 체크리스트 (2026-11-25 갱신)
 
-1. **CAN ID 배정 (`PJT-16` 댓글 `10011` 수정 반영)**: 비트필드 계산식 `ID = (우선순위 × 256) + (장치번호 × 64) + 기능번호` (`우선순위 bit 10~8`, 예시 `0x240`) 기준으로 `B_FAN_STATUS`, `B_FAN_FAULT`, `B_DIAG_RESP`, `DIAG_REQ` 최종 ID 확정 (`PJT-20` 보드 A 초안: `A_FAN_CMD=0x080`, `A_THERMAL_STATUS=0x180`, `B_FAN_STATUS=0x1C0`, `진단=0x380/0x300`).
-2. **진단 프로토콜 방식 통일**: `PJT-16`(`10011`)의 8B 단일 프레임 `DIAG_REQ`/`B_DIAG_RESP`(`0x01~0x03`)와 `PJT-20`의 `0x380/0x300 (UDS + ISO-TP)` 중 최종 채택 방식 및 엔디안 통일.
-3. **통신 속도 · 임계치**: Classic CAN `500 kbit/s` 확정, `B_FAN_STATUS` stale 기준(예: `500 ms`), `NO_ROTATION` 판정 시간, `RPM_DEVIATION` 허용 오차(%) 확정 (보드 B 실측 후 제안 예정).
-4. **단위 정합성**: `FAN_HW_SELFCHECK`의 `target_rpm_or_duty`를 `PJT-20` `A_FAN_CMD`의 목표 듀티(`%`)와 맞출지 RPM으로 할지 확정.
-5. **보조 UART 및 저장소 연계**: 양산형 보드 A/B 펌웨어의 디버그용 UART 유지 여부와 [`aide-ecu`](https://github.com/ssafy16-embbedded21-team1-2/aide-ecu) `common/` 명세를 `RPI5_Agent_Docker`와 어떤 버전 단위로 동기화할지 결정.
+`PJT-20`에서 보드 A 제안 ID(`0x080`/`0x180`/`0x1C0`, `500 kbit/s`)와 주기 메시지 바이트 배치가 정의되어 AI 측 수동 디코더는 선반영 완료했습니다. 아래 항목만 팀 합의 후 능동 진단 계층에 추가 반영합니다.
+
+1. **보드 B 주기 메시지 고장 형식 통일**: 보드 A(`fault_flags` 비트 플래그)와 보드 B(`fault_code` 단일 코드) 간 형식 통일 여부 및 `B_FAN_STATUS` stale(`500 ms`), 무회전/RPM 오차 임계치 확정 (`AIDE_B_FAULT_ENCODING`으로 양쪽 지원).
+2. **진단 프로토콜 방식 및 패딩·엔디안 통일**: `PJT-16`(`10011`)의 8B 단일 프레임 `DIAG_REQ`/`B_DIAG_RESP`(`0x01~0x03`)와 `PJT-20`의 `0x380/0x300 (UDS + ISO-TP)` 중 최종 채택 방식, ISO-TP 패딩 바이트(`0x00`/`0xCC`), DID 데이터 엔디안(리틀 vs 빅) 확정.
+3. **진단 항목(DID) 번호 배정 및 F-10 고장 주입 모드**: `보드A_기능명세서.pdf` 8·11절 기준 DID 목록·번호 배정(현재 온도/진동 RMS/요구 듀티·상태/팬 세기 표/히스테리시스/통신 카운터/버전)과 `a_state = TEST` 고장 주입 명령 형식 확정.
+4. **보조 UART 유지 여부 및 저장소 동기화**: 양산형 보드 A/B 펌웨어의 `/dev/ttyACM*` 디버그 출력 유지 여부와 [`aide-ecu`](https://github.com/ssafy16-embbedded21-team1-2/aide-ecu) `common/` DBC/YAML 동기화 방식 결정.
 
 ---
 

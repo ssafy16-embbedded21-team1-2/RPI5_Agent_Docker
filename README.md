@@ -4,7 +4,7 @@ Raspberry Pi 5에서 실행할 진단 Agent의 Docker 기반 시작 프로젝트
 LangGraph가 증거 수집 → 규칙 판정 → 결과 작성 순서를 실행하고,
 LangChain이 호스트의 `llama-server` 또는 선택적으로 Pamout 외부 LLM에 설명 생성을 요청합니다.
 
-**기본 런타임 모드(`EVIDENCE_PROVIDER=fixture`)는 가상 데이터로 동작합니다.** CAN·UART 실측 **Phase 1 파일럿**(`0x100` + ST-LINK VCP `hw_test CAN normal v1`) 코드는 구현 및 PC 테스트가 완료되었으며, `EVIDENCE_PROVIDER=http_collector`와 호스트 수집 데몬(`scripts/run_hw_collector.py`)을 함께 기동할 때 `mode="live"`로 동작합니다(보드 A/B Phase 2 본 규약 및 SWD 실물 제어는 미구현).
+**기본 런타임 모드(`EVIDENCE_PROVIDER=fixture`)는 가상 데이터로 동작합니다.** CAN·UART 실측 **Phase 1 파일럿**(`0x100` + ST-LINK VCP `hw_test CAN normal v1`)과 **Phase 2 수동 주기 수신 코덱·판정**(`aide-ecu-v1`: `A_FAN_CMD 0x080`, `A_THERMAL_STATUS 0x180`, `B_FAN_STATUS 0x1C0`, `LIVE_SPECIFICATION=aide_ecu`)이 구현 및 PC 테스트 완료 상태입니다. `EVIDENCE_PROVIDER=http_collector`와 호스트 수집 데몬(`scripts/run_hw_collector.py`)을 함께 기동할 때 `mode="live"`로 동작하며, 능동 진단 요청(`DIAG_REQ`) 및 2-보드 실물 E2E 검증과 SWD 실물 제어는 팀 협의 및 보드 통합 후 진행합니다.
 
 **현재 우선 목표 — 2026-11-13 회의 결정**: 장비·펌웨어·통신 명세·정상 기준을 충분히 확보한 환경에서
 진단을 검증합니다. 미확인 장비의 규약 추정·미지 로그 분석은 후속 범위입니다.
@@ -59,6 +59,7 @@ docker compose config --quiet
 docker compose up -d --build
 docker compose ps
 python3 scripts/smoke_test.py
+# 호스트 Python에 의존성이 없는 경우: uv run python scripts/smoke_test.py
 ```
 
 Windows PowerShell:
@@ -267,7 +268,7 @@ curl -sS http://127.0.0.1:8000/diagnose \
 | LLM 설명 | 로컬 JSON Schema 또는 설정한 외부 JSON 모드로 생성하고 같은 Pydantic 계약 검증 |
 | 모델 선택 | 요청별 `auto/local/external`, 오류 finding·로컬 실패 시 선택적 Pamout 전환 |
 | 모델 오류 | 호출 이력을 보존하고 최종 실패 시 코드 기반 요약 유지 |
-| 실제 CAN·UDS·SWD | 미구현. 현재 가상 데이터만 사용 |
+| 실제 CAN·UDS·SWD | Phase 1(`hw-test-f103-v1`) 및 Phase 2 수동 주기 수신(`aide-ecu-v1`: `0x080`/`0x180`/`0x1C0`) 구현. 능동 `DIAG_REQ`/UDS·SWD 실물 제어는 미구현 |
 | 승인·제어·복구 | 미구현. 제어 API와 임의 명령 실행 경로 없음 |
 | 이력·RAG·대화 | 미구현. 요청별 처리이며 결과는 응답으로 반환 |
 
@@ -353,11 +354,11 @@ src/rpi5_agent/
 ├── config.py           환경변수와 수집/모델 설정·검증
 ├── models.py           입력·증거·진단 결과 형식
 ├── errors.py           사용 불가능한 모델 응답의 오류 코드와 메타데이터
-├── specification.py    가상(fixture-bench-v1) · Phase 1 실측(hw-test-f103-v1) 명세
+├── specification.py    가상(fixture-bench-v1) · Phase 1(hw-test-f103-v1) · Phase 2(aide-ecu-v1) 명세
 ├── workflow.py         LangGraph 수집·판정·설명 연결
-├── assessment.py       순서·누락과 독립된 증거 검증·판정(가상/Phase 1 실측)
+├── assessment.py       순서·누락과 독립된 증거 검증·판정(가상/Phase 1/Phase 2 교차 판정)
 ├── evidence_summary.py 모델 입력 필드·크기 제한
-├── hw_collector.py     Phase 1 CAN(0x100)/UART 파서 · 구간 차분 · HTTP 브리지
+├── hw_collector.py     CAN(0x100/0x080/0x180/0x1C0)/UART 파서 · 구간 차분 · HTTP 브리지
 ├── llm.py              요청별 모델 선택·LangChain 호출·공통 출력 검증
 └── tools/
     ├── collection.py   수집기 계약·프로필·실행 전 도구 검사

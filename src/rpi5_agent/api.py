@@ -3,7 +3,7 @@ from threading import BoundedSemaphore
 
 from fastapi import FastAPI, HTTPException
 
-from rpi5_agent.config import Settings
+from rpi5_agent.config import Settings, build_live_specification
 from rpi5_agent.llm import RoutedSummarizer
 from rpi5_agent.models import DiagnoseRequest, Diagnosis, LLMTarget, Scenario
 from rpi5_agent.specification import FIXTURE_SPECIFICATION, HW_TEST_SPECIFICATION
@@ -34,6 +34,7 @@ def create_app(
                 timeout_seconds=config.collector_timeout_seconds,
                 can_interface=config.collector_can_interface,
                 uart_target=config.collector_uart_target,
+                specification=build_live_specification(config),
             )
         model = summarizer
         if config.llm_enabled and model is None:
@@ -66,6 +67,7 @@ def create_app(
     def capabilities() -> dict:
         profile = app.state.settings.diagnostic_profile
         is_live = app.state.mode == "live"
+        live_spec = getattr(app.state.provider, "specification", HW_TEST_SPECIFICATION)
         return {
             "mode": app.state.mode,
             "diagnostic_profile": profile,
@@ -73,9 +75,7 @@ def create_app(
             "physical_collection": is_live,
             "control_tools": False,
             "project_focus": "known_equipment_verification",
-            "assessment_specification_id": (
-                HW_TEST_SPECIFICATION.id if is_live else FIXTURE_SPECIFICATION.id
-            ),
+            "assessment_specification_id": (live_spec.id if is_live else FIXTURE_SPECIFICATION.id),
             "fixture_verification": app.state.provider is None,
         }
 

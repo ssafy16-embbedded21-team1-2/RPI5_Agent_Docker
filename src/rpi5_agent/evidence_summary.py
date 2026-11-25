@@ -4,7 +4,13 @@ import json
 
 from rpi5_agent.errors import SummaryError
 from rpi5_agent.models import Finding, ToolError, ToolResult
-from rpi5_agent.specification import FIXTURE_SPECIFICATION, HW_TEST_SPECIFICATION
+from rpi5_agent.specification import (
+    AIDE_ECU_SPECIFICATION,
+    FIXTURE_SPECIFICATION,
+    HW_TEST_SPECIFICATION,
+    LiveAideEcuSpecification,
+    LiveHwTestSpecification,
+)
 
 DATA_FIELDS = {
     "can.bus_state": {
@@ -31,7 +37,20 @@ DATA_FIELDS = {
         "age_ms",
         "last_alive_counter",
         "sequence_gap_count",
+        "consecutive_frozen_count",
         "magic_ok",
+        "duty_target",
+        "temp_degc",
+        "temp_valid",
+        "vib_rms_mg",
+        "vib_valid",
+        "a_state",
+        "thermal_state",
+        "fault_flags",
+        "fan_rpm",
+        "duty_actual",
+        "fan_state",
+        "fault_code",
     },
     "gateway.snapshot": {
         "gateway_age_ms",
@@ -72,7 +91,23 @@ DATA_FIELDS = {
 }
 
 
-def build_model_payload(evidence: list[ToolResult], findings: list[Finding]) -> dict:
+def _is_aide_ecu_evidence(evidence: list[ToolResult]) -> bool:
+    return any(
+        item.schema_version == AIDE_ECU_SPECIFICATION.id
+        or (
+            item.tool == "can.capture"
+            and item.target in {"a_fan_cmd", "a_thermal_status", "b_fan_status"}
+        )
+        for item in evidence
+    )
+
+
+def build_model_payload(
+    evidence: list[ToolResult],
+    findings: list[Finding],
+    *,
+    spec: LiveHwTestSpecification | LiveAideEcuSpecification | None = None,
+) -> dict:
     compact = []
     for item in evidence:
         view = item.model_dump(
@@ -120,10 +155,19 @@ def build_model_payload(evidence: list[ToolResult], findings: list[Finding]) -> 
     is_live = any(
         item.source in {"live_can", "live_uart", "manual_measurement"} for item in evidence
     )
-    spec = HW_TEST_SPECIFICATION if is_live else FIXTURE_SPECIFICATION
+    if is_live:
+        resolved_spec = (
+            spec
+            if spec is not None
+            else (
+                AIDE_ECU_SPECIFICATION if _is_aide_ecu_evidence(evidence) else HW_TEST_SPECIFICATION
+            )
+        )
+    else:
+        resolved_spec = FIXTURE_SPECIFICATION
     payload = {
         "mode": "live" if is_live else "fixture",
-        "assessment_specification": spec.model_dump(mode="json"),
+        "assessment_specification": resolved_spec.model_dump(mode="json"),
         "evidence": compact,
         "findings": [item.model_dump(include={"code", "severity", "message"}) for item in findings],
     }

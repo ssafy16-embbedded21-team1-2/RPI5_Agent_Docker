@@ -4,8 +4,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from rpi5_agent.models import Finding, ToolError, ToolResult
 from rpi5_agent.specification import (
+    AIDE_ECU_SPECIFICATION,
     FIXTURE_SPECIFICATION,
     HW_TEST_SPECIFICATION,
+    LiveAideEcuSpecification,
     LiveHwTestSpecification,
 )
 
@@ -50,8 +52,31 @@ class LiveCanCaptureData(DecodedData):
     valid_frame_count_in_window: int = Field(ge=0)
     invalid_frame_count_in_window: int = Field(ge=0)
     sequence_gap_count: int = Field(ge=0)
+    consecutive_frozen_count: int = Field(default=0, ge=0)
     age_ms: float | None = Field(default=None, ge=0)
     magic_ok: bool | None = None
+
+
+class LiveFanCmdData(LiveCanCaptureData):
+    duty_target: int = Field(ge=0, le=100)
+
+
+class LiveThermalStatusData(LiveCanCaptureData):
+    temp_degc: float | int | None = None
+    temp_valid: bool
+    duty_target: int = Field(ge=0, le=100)
+    vib_rms_mg: int | None = Field(default=None, ge=0)
+    vib_valid: bool
+    a_state: int = Field(ge=0, le=3)
+    thermal_state: int = Field(ge=0, le=3)
+    fault_flags: int = Field(ge=0, le=255)
+
+
+class LiveFanStatusData(LiveCanCaptureData):
+    fan_rpm: int = Field(ge=0, le=65535)
+    duty_actual: int = Field(ge=0, le=100)
+    fan_state: int = Field(ge=0, le=4)
+    fault_code: int = Field(ge=0, le=255)
 
 
 class LiveUartData(DecodedData):
@@ -238,7 +263,7 @@ def _assess_live_capture(
 
 def _assess_live_uart(
     uart: ToolResult | None,
-    spec: LiveHwTestSpecification,
+    spec: LiveHwTestSpecification | LiveAideEcuSpecification,
     telemetry_missing: bool,
     findings: list[Finding],
 ) -> None:
@@ -369,9 +394,445 @@ def evaluate_live_hw_test(
     return findings
 
 
-def evaluate(evidence: list[ToolResult]) -> list[Finding]:
-    if any(item.source in {"live_can", "live_uart"} for item in evidence):
-        return evaluate_live_hw_test(evidence)
+_BOARD_A_FAULT_BITS: tuple[tuple[int, str, str, str], ...] = (
+    (
+        0x01,
+        "BOARD_A_FAULT_TEMP_SENSOR",
+        "error",
+        "보드 A가 온도 센서(BMP280) 고장(0x01)을 보고했습니다.",
+    ),
+    (
+        0x02,
+        "BOARD_A_FAULT_VIB_SENSOR",
+        "warning",
+        "보드 A가 진동 센서(MPU6050) 고장(0x02)을 보고했습니다.",
+    ),
+    (
+        0x04,
+        "BOARD_A_FAULT_FAN_STATUS_TIMEOUT",
+        "error",
+        "보드 A가 냉각팬 상태(B_FAN_STATUS) 수신 타임아웃(0x03)을 보고했습니다.",
+    ),
+    (
+        0x08,
+        "BOARD_A_FAULT_FAN_REPORTED",
+        "error",
+        "보드 A가 보드 B 냉각팬 FAULT 응답(0x04)을 감지했습니다.",
+    ),
+    (
+        0x10,
+        "BOARD_A_FAULT_FAN_DUTY_MISMATCH",
+        "warning",
+        "보드 A가 목표 듀티와 보드 B 실제 듀티 불일치(0x05)를 보고했습니다.",
+    ),
+    (
+        0x20,
+        "BOARD_A_FAULT_CAN_BUS_OFF",
+        "error",
+        "보드 A가 bxCAN Bus-Off 발생 후 복구 이력(0x06)을 보고했습니다.",
+    ),
+    (
+        0x40,
+        "BOARD_A_FAULT_TASK_OVERRUN",
+        "warning",
+        "보드 A가 주기 태스크 오버런(0x07)을 보고했습니다.",
+    ),
+    (
+        0x80,
+        "BOARD_A_FAULT_UNKNOWN_FLAG",
+        "warning",
+        "보드 A가 예약된 fault_flags 비트(bit 7)를 보고했습니다.",
+    ),
+)
+
+_BOARD_B_FAULT_CODES: dict[int, tuple[str, str]] = {
+    0x01: (
+        "FAN_FAULT_NO_ROTATION",
+        "보드 B가 냉각팬 무회전 고장(NO_ROTATION, 0x01)을 보고했습니다.",
+    ),
+    0x02: (
+        "FAN_FAULT_RPM_DEVIATION",
+        "보드 B가 냉각팬 회전수 편차 고장(RPM_DEVIATION, 0x02)을 보고했습니다.",
+    ),
+    0x03: (
+        "FAN_FAULT_CMD_TIMEOUT",
+        "보드 B가 팬 명령 수신 타임아웃(CMD_TIMEOUT, 0x03)을 보고했습니다.",
+    ),
+}
+
+_BOARD_B_FAULT_BITS: tuple[tuple[int, str, str], ...] = (
+    (0x01, "FAN_FAULT_NO_ROTATION", "보드 B가 냉각팬 무회전 고장(NO_ROTATION)을 보고했습니다."),
+    (
+        0x02,
+        "FAN_FAULT_RPM_DEVIATION",
+        "보드 B가 냉각팬 회전수 편차 고장(RPM_DEVIATION)을 보고했습니다.",
+    ),
+    (0x04, "FAN_FAULT_CMD_TIMEOUT", "보드 B가 팬 명령 수신 타임아웃(CMD_TIMEOUT)을 보고했습니다."),
+)
+
+
+def _is_aide_ecu_evidence(evidence: list[ToolResult]) -> bool:
+    return any(
+        item.schema_version == AIDE_ECU_SPECIFICATION.id
+        or (
+            item.tool == "can.capture"
+            and item.target in {"a_fan_cmd", "a_thermal_status", "b_fan_status"}
+        )
+        for item in evidence
+    )
+
+
+def _assess_aide_stream(
+    cap: ToolResult | None,
+    *,
+    prefix: str,
+    can_id: str,
+    timeout_ms: float,
+    alive_freeze_threshold: int,
+    model: type[DecodedData],
+    findings: list[Finding],
+):
+    if cap is None or cap.status != "ok":
+        findings.append(
+            finding(
+                f"{prefix}_MISSING", f"{prefix}({can_id}) 프레임을 수신하지 못했습니다.", "error"
+            )
+        )
+        return None
+    base_data = decode(cap, LiveCanCaptureData)
+    if cap.validity == "invalid" or (
+        base_data is not None
+        and base_data.valid_frame_count_in_window == 0
+        and base_data.invalid_frame_count_in_window > 0
+    ):
+        findings.append(
+            finding(
+                f"{prefix}_INVALID",
+                f"{prefix}({can_id}) 프레임 형식이 규약과 일치하지 않습니다.",
+                "error",
+            )
+        )
+        return None
+    if base_data is None or base_data.frame_count_in_window == 0:
+        findings.append(
+            finding(
+                f"{prefix}_MISSING",
+                f"관측 윈도우 내 {prefix}({can_id}) 수신 건수가 0입니다.",
+                "error",
+            )
+        )
+        return None
+    if cap.freshness == "stale" or (base_data.age_ms is not None and base_data.age_ms > timeout_ms):
+        findings.append(
+            finding(
+                f"{prefix}_STALE",
+                f"{prefix}({can_id}) 수신 경과시간이 기준({int(timeout_ms)} ms)을 초과했습니다.",
+            )
+        )
+        return None
+    if base_data.consecutive_frozen_count >= alive_freeze_threshold:
+        findings.append(
+            finding(
+                f"{prefix}_ALIVE_FROZEN",
+                f"{prefix}({can_id}) alive_cnt가 "
+                f"{base_data.consecutive_frozen_count}회 연속 정지해 송신 멈춤이 의심됩니다.",
+                "error",
+            )
+        )
+        return None
+    decoded = decode(cap, model)
+    if decoded is None:
+        findings.append(
+            finding(
+                f"{prefix}_INVALID",
+                f"{prefix}({can_id}) 디코딩 필드 형식이 유효하지 않습니다.",
+                "error",
+            )
+        )
+        return None
+    findings.append(
+        finding(
+            f"{prefix}_FRESH",
+            f"{prefix}({can_id}) 텔레메트리가 정상 주기 내 수신 중입니다.",
+            "info",
+        )
+    )
+    if base_data.sequence_gap_count > 0:
+        findings.append(
+            finding(
+                f"{prefix}_SEQUENCE_GAP",
+                f"{prefix}({can_id})의 alive_cnt 누락 구간이 관측되었습니다.",
+            )
+        )
+    return decoded
+
+
+def _assess_board_a_semantics(
+    thermal: LiveThermalStatusData,
+    cmd: LiveFanCmdData | None,
+    findings: list[Finding],
+) -> None:
+    if thermal.a_state == 0:
+        findings.append(finding("BOARD_A_INIT_STATE", "보드 A가 초기화(INIT) 상태입니다.", "info"))
+    elif thermal.a_state == 2:
+        findings.append(
+            finding(
+                "BOARD_A_FAILSAFE_ACTIVE",
+                "보드 A가 페일세이프(FAILSAFE, 팬 100% 명령) 상태입니다.",
+                "error",
+            )
+        )
+        if thermal.duty_target != 100 or (cmd is not None and cmd.duty_target != 100):
+            findings.append(
+                finding(
+                    "BOARD_A_FAILSAFE_DUTY_VIOLATION",
+                    "보드 A가 FAILSAFE 상태이지만 목표 듀티가 100%로 명령되지 않았습니다.",
+                    "error",
+                )
+            )
+    elif thermal.a_state == 3:
+        findings.append(
+            finding(
+                "BOARD_A_TEST_MODE_ACTIVE",
+                "보드 A가 고장 주입 시험 모드(TEST)로 동작 중입니다.",
+                "info",
+            )
+        )
+
+    if thermal.thermal_state == 1:
+        findings.append(
+            finding("THERMAL_STATE_WARNING", "보드 A 열관리 상태가 경고(WARNING) 구간입니다.")
+        )
+    elif thermal.thermal_state == 2:
+        findings.append(
+            finding(
+                "THERMAL_STATE_OVER_TEMP",
+                "보드 A 열관리 상태가 과온(OVER_TEMP, 55°C 이상) 구간입니다. "
+                "센서 고장과 구분합니다.",
+            )
+        )
+
+    for mask, code, severity, message in _BOARD_A_FAULT_BITS:
+        if thermal.fault_flags & mask:
+            findings.append(finding(code, message, severity))
+
+    if (thermal.thermal_state == 3 or not thermal.temp_valid) and not (thermal.fault_flags & 0x01):
+        findings.append(
+            finding(
+                "BOARD_A_TEMP_INVALID",
+                "보드 A 주변 온도 값이 무효(0x7FFF)이지만 "
+                "fault_flags 온도 고장 비트가 미설정 상태입니다.",
+                "error",
+            )
+        )
+    if not thermal.vib_valid and not (thermal.fault_flags & 0x02) and thermal.a_state != 0:
+        findings.append(
+            finding(
+                "BOARD_A_VIB_INVALID",
+                "보드 A 진동 RMS 값이 무효(0xFFFF)입니다.",
+            )
+        )
+
+
+def _assess_board_b_semantics(
+    fan: LiveFanStatusData,
+    spec: LiveAideEcuSpecification,
+    findings: list[Finding],
+) -> None:
+    if fan.fan_state == 0:
+        findings.append(finding("BOARD_B_INIT_STATE", "보드 B가 초기화(INIT) 상태입니다.", "info"))
+    elif fan.fan_state == 4:
+        findings.append(
+            finding(
+                "FAN_TEST_MODE_ACTIVE",
+                "보드 B가 고장 주입 시험 모드(TEST)로 동작 중입니다.",
+                "info",
+            )
+        )
+
+    if spec.b_fault_encoding == "bitmask":
+        for mask, code, message in _BOARD_B_FAULT_BITS:
+            if fan.fault_code & mask:
+                findings.append(finding(code, message, "error"))
+        if fan.fault_code & ~0x07:
+            findings.append(
+                finding(
+                    "FAN_FAULT_UNKNOWN_CODE",
+                    "보드 B가 알 수 없는 고장 비트 플래그를 보고했습니다.",
+                    "error",
+                )
+            )
+    elif fan.fault_code != 0:
+        mapped = _BOARD_B_FAULT_CODES.get(fan.fault_code)
+        if mapped is not None:
+            findings.append(finding(mapped[0], mapped[1], "error"))
+        else:
+            findings.append(
+                finding(
+                    "FAN_FAULT_UNKNOWN_CODE",
+                    f"보드 B가 정의되지 않은 고장 코드(0x{fan.fault_code:02X})를 보고했습니다.",
+                    "error",
+                )
+            )
+
+    if fan.fan_state == 3 and fan.fault_code == 0:
+        findings.append(
+            finding(
+                "FAN_STATE_FAULT_UNSPECIFIED",
+                "보드 B가 FAULT 상태이지만 상세 fault_code가 0x00입니다.",
+                "error",
+            )
+        )
+
+
+def evaluate_live_aide_ecu(
+    evidence: list[ToolResult],
+    spec: LiveAideEcuSpecification = AIDE_ECU_SPECIFICATION,
+) -> list[Finding]:
+    """Deterministic assessment rules for Phase 2 Board A & B periodic CAN telemetry."""
+    grouped, findings = _group_evidence(evidence)
+    bus = _single_result(grouped, "can.bus_state", spec.can_interface)
+    cmd_cap = _single_result(grouped, "can.capture", "a_fan_cmd")
+    thermal_cap = _single_result(grouped, "can.capture", "a_thermal_status")
+    fan_cap = _single_result(grouped, "can.capture", "b_fan_status")
+    uart = (
+        _single_result(grouped, "serial.read_can_diagnostics", spec.uart_target)
+        if spec.uart_target
+        else next(
+            (
+                item
+                for item in evidence
+                if item.tool == "serial.read_can_diagnostics"
+                and _single_result(grouped, item.tool, item.target) is not None
+            ),
+            None,
+        )
+    )
+
+    present = [item for item in (bus, cmd_cap, thermal_cap, fan_cap, uart) if item is not None]
+    unreachable_count = sum(1 for item in present if _is_collector_unreachable(item))
+    if unreachable_count > 0:
+        findings.append(
+            finding(
+                "COLLECTOR_UNREACHABLE",
+                "호스트 CAN/UART 수집 데몬(rpi5-hw-collector) 연결에 실패했거나 "
+                "시간이 초과되었습니다.",
+                "error",
+            )
+        )
+        if unreachable_count == len(present):
+            return findings
+
+    _assess_live_bus(bus, findings)
+    bus_data = decode(bus, LiveBusStateData)
+    local_healthy = (
+        bus_data is not None and bus_data.state == "active" and bus_data.operstate == "UP"
+    )
+
+    if not local_healthy:
+        findings.append(
+            finding(
+                "REMOTE_STATE_UNKNOWN",
+                "로컬 CAN 어댑터가 정상 활성 상태가 아니어서 "
+                "보드 A·B 원격 상태를 판정할 수 없습니다.",
+            )
+        )
+    else:
+        cmd_data = _assess_aide_stream(
+            cmd_cap,
+            prefix="A_FAN_CMD",
+            can_id=spec.a_fan_cmd_can_id,
+            timeout_ms=spec.a_cmd_timeout_ms,
+            alive_freeze_threshold=spec.alive_freeze_threshold,
+            model=LiveFanCmdData,
+            findings=findings,
+        )
+        thermal_data = _assess_aide_stream(
+            thermal_cap,
+            prefix="A_THERMAL_STATUS",
+            can_id=spec.a_thermal_status_can_id,
+            timeout_ms=spec.status_timeout_ms,
+            alive_freeze_threshold=spec.alive_freeze_threshold,
+            model=LiveThermalStatusData,
+            findings=findings,
+        )
+        fan_data = _assess_aide_stream(
+            fan_cap,
+            prefix="B_FAN_STATUS",
+            can_id=spec.b_fan_status_can_id,
+            timeout_ms=spec.status_timeout_ms,
+            alive_freeze_threshold=spec.alive_freeze_threshold,
+            model=LiveFanStatusData,
+            findings=findings,
+        )
+        if thermal_data is not None:
+            _assess_board_a_semantics(thermal_data, cmd_data, findings)
+        if fan_data is not None:
+            _assess_board_b_semantics(fan_data, spec, findings)
+
+        emitted = {item.code for item in findings}
+        if "FAN_FAULT_CMD_TIMEOUT" in emitted:
+            if "A_FAN_CMD_FRESH" in emitted:
+                findings.append(
+                    finding(
+                        "CROSS_BOARD_B_RX_PATH_SUSPECTED",
+                        "RPi는 A_FAN_CMD를 정상 수신 중이나 보드 B가 CMD_TIMEOUT을 보고해 "
+                        "보드 B 수신 경로 이상이 의심됩니다.",
+                        "error",
+                    )
+                )
+            else:
+                findings.append(
+                    finding(
+                        "CROSS_BOARD_A_CMD_ABSENT_CONFIRMED",
+                        "RPi 관측상 A_FAN_CMD가 미수신·정지 상태이며 "
+                        "보드 B CMD_TIMEOUT 보고와 일치합니다.",
+                        "error",
+                    )
+                )
+        if "BOARD_A_FAULT_FAN_STATUS_TIMEOUT" in emitted:
+            if "B_FAN_STATUS_FRESH" in emitted:
+                findings.append(
+                    finding(
+                        "CROSS_BOARD_A_RX_PATH_SUSPECTED",
+                        "RPi는 B_FAN_STATUS를 정상 수신 중이나 보드 A가 팬 상태 타임아웃을 "
+                        "보고해 보드 A 수신 경로 이상이 의심됩니다.",
+                        "error",
+                    )
+                )
+            else:
+                findings.append(
+                    finding(
+                        "CROSS_BOARD_B_STATUS_ABSENT_CONFIRMED",
+                        "RPi 관측상 B_FAN_STATUS가 미수신·정지 상태이며 "
+                        "보드 A 타임아웃 보고와 일치합니다.",
+                        "error",
+                    )
+                )
+
+    if spec.uart_target is not None or uart is not None:
+        _assess_live_uart(uart, spec, False, findings)
+
+    return findings
+
+
+def evaluate(
+    evidence: list[ToolResult],
+    *,
+    spec: LiveHwTestSpecification | LiveAideEcuSpecification | None = None,
+) -> list[Finding]:
+    if isinstance(spec, LiveAideEcuSpecification) or (
+        spec is None and _is_aide_ecu_evidence(evidence)
+    ):
+        return evaluate_live_aide_ecu(
+            evidence, spec if isinstance(spec, LiveAideEcuSpecification) else AIDE_ECU_SPECIFICATION
+        )
+    if isinstance(spec, LiveHwTestSpecification) or any(
+        item.source in {"live_can", "live_uart"} for item in evidence
+    ):
+        return evaluate_live_hw_test(
+            evidence, spec if isinstance(spec, LiveHwTestSpecification) else HW_TEST_SPECIFICATION
+        )
 
     grouped, findings = _group_evidence(evidence)
 

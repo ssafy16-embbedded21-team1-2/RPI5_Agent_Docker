@@ -22,6 +22,12 @@ DEFAULT_UART_DEVICE_BY_ID = (
 HW_TEST_CAN_ID = 0x100
 HW_TEST_MAGIC = b"\xa5\x5a\x00"
 
+A_FAN_CMD_CAN_ID = 0x080
+A_THERMAL_STATUS_CAN_ID = 0x180
+B_FAN_STATUS_CAN_ID = 0x1C0
+TEMP_AMBIENT_INVALID_RAW = 0x7FFF
+VIB_RMS_INVALID_RAW = 0xFFFF
+
 UART_LINE_PATTERN = re.compile(
     r"^t=(\d+) ms TEC=(\d+) REC=(\d+) LEC=(\d+) EWG=(\d+) EPV=(\d+) BOFF=(\d+) "
     r"\| txreq=(\d+) txok=(\d+) txabort=(\d+) txbusy=(\d+) errcb=(\d+) "
@@ -29,6 +35,11 @@ UART_LINE_PATTERN = re.compile(
 )
 
 _MONOTONIC_COUNTER_KEYS = ("txreq", "txok", "txabort", "txbusy", "errcb", "rx")
+
+
+def format_can_id(can_id: int) -> str:
+    """Format an 11-bit standard CAN ID as 3-digit uppercase hex (e.g., 0x080)."""
+    return f"0x{can_id:03X}"
 
 
 def parse_hw_test_can_frame(
@@ -52,9 +63,120 @@ def parse_hw_test_can_frame(
     }
 
 
+def parse_a_fan_cmd_frame(
+    can_id: int,
+    data: bytes | bytearray | list[int],
+    *,
+    dlc: int | None = None,
+    expected_can_id: int = A_FAN_CMD_CAN_ID,
+) -> dict[str, Any]:
+    """Decode and validate a Phase 2 A_FAN_CMD (0x080) classic CAN frame."""
+    raw = bytes(data)
+    actual_dlc = dlc if dlc is not None else len(raw)
+    if can_id == expected_can_id and actual_dlc == 8 and len(raw) == 8 and 0 <= raw[0] <= 100:
+        return {
+            "valid": True,
+            "dlc": 8,
+            "duty_target": raw[0],
+            "alive_counter": raw[7],
+        }
+    return {
+        "valid": False,
+        "dlc": actual_dlc,
+        "duty_target": None,
+        "alive_counter": None,
+    }
+
+
+def parse_a_thermal_status_frame(
+    can_id: int,
+    data: bytes | bytearray | list[int],
+    *,
+    dlc: int | None = None,
+    expected_can_id: int = A_THERMAL_STATUS_CAN_ID,
+) -> dict[str, Any]:
+    """Decode and validate a Phase 2 A_THERMAL_STATUS (0x180) classic CAN frame."""
+    raw = bytes(data)
+    actual_dlc = dlc if dlc is not None else len(raw)
+    if can_id == expected_can_id and actual_dlc == 8 and len(raw) == 8:
+        temp_raw = int.from_bytes(raw[0:2], "little", signed=True)
+        duty_target = raw[2]
+        vib_raw = int.from_bytes(raw[3:5], "little", signed=False)
+        a_state = raw[5] & 0x0F
+        thermal_state = (raw[5] >> 4) & 0x0F
+        fault_flags = raw[6]
+        alive_counter = raw[7]
+        if 0 <= duty_target <= 100 and a_state <= 3 and thermal_state <= 3:
+            temp_valid = temp_raw != TEMP_AMBIENT_INVALID_RAW
+            vib_valid = vib_raw != VIB_RMS_INVALID_RAW
+            return {
+                "valid": True,
+                "dlc": 8,
+                "temp_degc": round(temp_raw * 0.1, 1) if temp_valid else None,
+                "temp_valid": temp_valid,
+                "duty_target": duty_target,
+                "vib_rms_mg": vib_raw if vib_valid else None,
+                "vib_valid": vib_valid,
+                "a_state": a_state,
+                "thermal_state": thermal_state,
+                "fault_flags": fault_flags,
+                "alive_counter": alive_counter,
+            }
+    return {
+        "valid": False,
+        "dlc": actual_dlc,
+        "temp_degc": None,
+        "temp_valid": None,
+        "duty_target": None,
+        "vib_rms_mg": None,
+        "vib_valid": None,
+        "a_state": None,
+        "thermal_state": None,
+        "fault_flags": None,
+        "alive_counter": None,
+    }
+
+
+def parse_b_fan_status_frame(
+    can_id: int,
+    data: bytes | bytearray | list[int],
+    *,
+    dlc: int | None = None,
+    expected_can_id: int = B_FAN_STATUS_CAN_ID,
+) -> dict[str, Any]:
+    """Decode and validate a Phase 2 B_FAN_STATUS (0x1C0) classic CAN frame."""
+    raw = bytes(data)
+    actual_dlc = dlc if dlc is not None else len(raw)
+    if can_id == expected_can_id and actual_dlc == 8 and len(raw) == 8:
+        fan_rpm = int.from_bytes(raw[0:2], "little", signed=False)
+        duty_actual = raw[2]
+        fan_state = raw[3]
+        fault_code = raw[4]
+        alive_counter = raw[7]
+        if 0 <= duty_actual <= 100 and fan_state <= 4:
+            return {
+                "valid": True,
+                "dlc": 8,
+                "fan_rpm": fan_rpm,
+                "duty_actual": duty_actual,
+                "fan_state": fan_state,
+                "fault_code": fault_code,
+                "alive_counter": alive_counter,
+            }
+    return {
+        "valid": False,
+        "dlc": actual_dlc,
+        "fan_rpm": None,
+        "duty_actual": None,
+        "fan_state": None,
+        "fault_code": None,
+        "alive_counter": None,
+    }
+
+
 def compute_alive_counter_gap(prev_counter: int | None, curr_counter: int) -> int:
-    """Return missed uint8 sequence steps between two valid alive_counter values."""
-    if prev_counter is None:
+    """Return missed uint8 sequence steps between two distinct valid alive_counter values."""
+    if prev_counter is None or curr_counter == prev_counter:
         return 0
     expected = (prev_counter + 1) & 0xFF
     if curr_counter == expected:
@@ -62,24 +184,51 @@ def compute_alive_counter_gap(prev_counter: int | None, curr_counter: int) -> in
     return (curr_counter - prev_counter - 1) & 0xFF
 
 
+def is_alive_counter_frozen(prev_counter: int | None, curr_counter: int) -> bool:
+    """Return True when a consecutive valid frame repeats the exact same alive_counter."""
+    return prev_counter is not None and curr_counter == prev_counter
+
+
+DEFAULT_CAN_CODECS: dict[int, Callable[..., dict[str, Any]]] = {
+    HW_TEST_CAN_ID: parse_hw_test_can_frame,
+    A_FAN_CMD_CAN_ID: parse_a_fan_cmd_frame,
+    A_THERMAL_STATUS_CAN_ID: parse_a_thermal_status_frame,
+    B_FAN_STATUS_CAN_ID: parse_b_fan_status_frame,
+}
+
+
 @dataclass(frozen=True, slots=True)
 class _CanFrameEvent:
     rx_utc: datetime
     dlc: int
     valid: bool
-    magic_ok: bool
+    decoded: dict[str, Any]
     alive_counter: int | None
     gap: int
+    consecutive_frozen: int
+
+
+class _CanStreamState:
+    def __init__(self, max_events: int) -> None:
+        self.events: deque[_CanFrameEvent] = deque(maxlen=max_events)
+        self.last_valid_counter: int | None = None
+        self.consecutive_frozen: int = 0
+        self.last_event: _CanFrameEvent | None = None
 
 
 class CanCollectorBuffer:
-    """Thread-safe sliding-window accumulator for hw_test 0x100 frames."""
+    """Thread-safe sliding-window accumulator for configured Classic CAN frames."""
 
-    def __init__(self, *, max_events: int = 5000) -> None:
+    def __init__(
+        self,
+        *,
+        max_events: int = 5000,
+        codecs: dict[int, Callable[..., dict[str, Any]]] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
-        self._events: deque[_CanFrameEvent] = deque(maxlen=max_events)
-        self._last_valid_counter: int | None = None
-        self._last_event: _CanFrameEvent | None = None
+        self._max_events = max_events
+        self._codecs = dict(DEFAULT_CAN_CODECS if codecs is None else codecs)
+        self._streams: dict[int, _CanStreamState] = {}
 
     def record_frame(
         self,
@@ -90,25 +239,38 @@ class CanCollectorBuffer:
         rx_utc: datetime | None = None,
     ) -> dict[str, Any]:
         ts = rx_utc if rx_utc is not None else datetime.now(UTC)
-        parsed = parse_hw_test_can_frame(can_id, data, dlc=dlc)
-        if can_id != HW_TEST_CAN_ID:
-            return parsed
+        codec = self._codecs.get(can_id)
+        if codec is None:
+            actual_dlc = dlc if dlc is not None else len(bytes(data))
+            return {"valid": False, "alive_counter": None, "dlc": actual_dlc}
+        parsed = codec(can_id, data, dlc=dlc)
         with self._lock:
+            stream = self._streams.get(can_id)
+            if stream is None:
+                stream = _CanStreamState(self._max_events)
+                self._streams[can_id] = stream
             gap = 0
-            if parsed["valid"]:
+            if parsed["valid"] and parsed.get("alive_counter") is not None:
                 counter = int(parsed["alive_counter"])
-                gap = compute_alive_counter_gap(self._last_valid_counter, counter)
-                self._last_valid_counter = counter
+                if is_alive_counter_frozen(stream.last_valid_counter, counter):
+                    stream.consecutive_frozen += 1
+                else:
+                    gap = compute_alive_counter_gap(stream.last_valid_counter, counter)
+                    stream.consecutive_frozen = 0
+                    stream.last_valid_counter = counter
+            else:
+                stream.consecutive_frozen = 0
             event = _CanFrameEvent(
                 rx_utc=ts,
                 dlc=int(parsed["dlc"]),
                 valid=bool(parsed["valid"]),
-                magic_ok=bool(parsed["magic_ok"]),
-                alive_counter=parsed["alive_counter"],
+                decoded=dict(parsed),
+                alive_counter=parsed.get("alive_counter"),
                 gap=gap,
+                consecutive_frozen=stream.consecutive_frozen,
             )
-            self._events.append(event)
-            self._last_event = event
+            stream.events.append(event)
+            stream.last_event = event
         return parsed
 
     def snapshot(
@@ -121,50 +283,48 @@ class CanCollectorBuffer:
     ) -> dict[str, Any]:
         ref_now = now if now is not None else datetime.now(UTC)
         with self._lock:
-            events = list(self._events)
-            last_event = self._last_event
+            stream_items = [
+                (can_id, list(stream.events), stream.last_event)
+                for can_id, stream in self._streams.items()
+            ]
 
-        in_window = [
-            ev for ev in events if (ref_now - ev.rx_utc).total_seconds() * 1000.0 <= window_ms
-        ]
         streams: dict[str, Any] = {}
-        if in_window:
-            latest = in_window[-1]
-            age_ms = max(0.0, (ref_now - latest.rx_utc).total_seconds() * 1000.0)
-            valid_count = sum(1 for ev in in_window if ev.valid)
-            invalid_count = len(in_window) - valid_count
-            streams["0x100"] = {
-                "dlc": latest.dlc,
-                "frame_count_in_window": len(in_window),
-                "valid_frame_count_in_window": valid_count,
-                "invalid_frame_count_in_window": invalid_count,
-                "last_rx_utc": latest.rx_utc.isoformat(),
-                "age_ms": round(age_ms, 2),
-                "last_alive_counter": latest.alive_counter,
-                "sequence_gap_count": sum(ev.gap for ev in in_window),
-                "decoded": {
-                    "magic_ok": latest.magic_ok,
-                    "alive_counter": latest.alive_counter,
-                    "valid": latest.valid,
-                },
-            }
-        elif last_event is not None:
-            age_ms = max(0.0, (ref_now - last_event.rx_utc).total_seconds() * 1000.0)
-            streams["0x100"] = {
-                "dlc": last_event.dlc,
-                "frame_count_in_window": 0,
-                "valid_frame_count_in_window": 0,
-                "invalid_frame_count_in_window": 0,
-                "last_rx_utc": last_event.rx_utc.isoformat(),
-                "age_ms": round(age_ms, 2),
-                "last_alive_counter": last_event.alive_counter,
-                "sequence_gap_count": 0,
-                "decoded": {
-                    "magic_ok": last_event.magic_ok,
-                    "alive_counter": last_event.alive_counter,
-                    "valid": last_event.valid,
-                },
-            }
+        for can_id, events, last_event in stream_items:
+            id_key = format_can_id(can_id)
+            in_window = [
+                ev for ev in events if (ref_now - ev.rx_utc).total_seconds() * 1000.0 <= window_ms
+            ]
+            if in_window:
+                latest = in_window[-1]
+                age_ms = max(0.0, (ref_now - latest.rx_utc).total_seconds() * 1000.0)
+                valid_count = sum(1 for ev in in_window if ev.valid)
+                invalid_count = len(in_window) - valid_count
+                streams[id_key] = {
+                    "dlc": latest.dlc,
+                    "frame_count_in_window": len(in_window),
+                    "valid_frame_count_in_window": valid_count,
+                    "invalid_frame_count_in_window": invalid_count,
+                    "last_rx_utc": latest.rx_utc.isoformat(),
+                    "age_ms": round(age_ms, 2),
+                    "last_alive_counter": latest.alive_counter,
+                    "sequence_gap_count": sum(ev.gap for ev in in_window),
+                    "consecutive_frozen_count": latest.consecutive_frozen,
+                    "decoded": dict(latest.decoded),
+                }
+            elif last_event is not None:
+                age_ms = max(0.0, (ref_now - last_event.rx_utc).total_seconds() * 1000.0)
+                streams[id_key] = {
+                    "dlc": last_event.dlc,
+                    "frame_count_in_window": 0,
+                    "valid_frame_count_in_window": 0,
+                    "invalid_frame_count_in_window": 0,
+                    "last_rx_utc": last_event.rx_utc.isoformat(),
+                    "age_ms": round(age_ms, 2),
+                    "last_alive_counter": last_event.alive_counter,
+                    "sequence_gap_count": 0,
+                    "consecutive_frozen_count": 0,
+                    "decoded": dict(last_event.decoded),
+                }
 
         return {
             "collected_at": ref_now.isoformat(),

@@ -63,17 +63,17 @@ def build_workflow(
         return {"evidence": evidence}
 
     def assess(state: DiagnosticState) -> dict:
-        return {"findings": evaluate(state["evidence"])}
+        live_spec = getattr(collector, "specification", None)
+        return {"findings": evaluate(state["evidence"], spec=live_spec)}
 
     def report(state: DiagnosticState) -> dict:
         is_live = getattr(collector, "mode", "fixture") == "live"
+        live_spec = getattr(collector, "specification", HW_TEST_SPECIFICATION)
         prefix = "[실측 데이터]" if is_live else "[가상 데이터]"
         result = Diagnosis(
             request_id=str(uuid4()),
             mode="live" if is_live else "fixture",
-            assessment_specification_id=(
-                HW_TEST_SPECIFICATION.id if is_live else FIXTURE_SPECIFICATION.id
-            ),
+            assessment_specification_id=(live_spec.id if is_live else FIXTURE_SPECIFICATION.id),
             diagnostic_profile=profile,
             scenario=None if is_live else state["request"].scenario,
             evidence=state["evidence"],

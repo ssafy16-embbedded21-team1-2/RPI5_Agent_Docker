@@ -4,6 +4,10 @@ from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_va
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from rpi5_agent.models import DiagnosticProfile
+from rpi5_agent.specification import (
+    LiveAideEcuSpecification,
+    LiveHwTestSpecification,
+)
 
 
 class Settings(BaseSettings):
@@ -11,6 +15,9 @@ class Settings(BaseSettings):
 
     diagnostic_profile: DiagnosticProfile = DiagnosticProfile.PRODUCT
     evidence_provider: Literal["fixture", "http_collector"] = "fixture"
+    live_specification: Literal["hw_test_f103", "aide_ecu"] = "hw_test_f103"
+    aide_b_fault_encoding: Literal["code", "bitmask"] = "code"
+    aide_include_uart: bool = False
     collector_base_url: str = "http://127.0.0.1:8090"
     collector_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     collector_can_interface: str = Field(default="can0", pattern=r"^[a-zA-Z0-9_.-]{1,16}$")
@@ -77,3 +84,19 @@ class Settings(BaseSettings):
                     "EXTERNAL_LLM_API_KEY must not contain whitespace/control characters"
                 )
         return self
+
+
+def build_live_specification(
+    settings: Settings,
+) -> LiveHwTestSpecification | LiveAideEcuSpecification:
+    """Build the configured Phase 1 or Phase 2 live assessment specification."""
+    if settings.live_specification == "aide_ecu":
+        return LiveAideEcuSpecification(
+            can_interface=settings.collector_can_interface,
+            b_fault_encoding=settings.aide_b_fault_encoding,
+            uart_target=settings.collector_uart_target if settings.aide_include_uart else None,
+        )
+    return LiveHwTestSpecification(
+        can_interface=settings.collector_can_interface,
+        uart_target=settings.collector_uart_target,
+    )

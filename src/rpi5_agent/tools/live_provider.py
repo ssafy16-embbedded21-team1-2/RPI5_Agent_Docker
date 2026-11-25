@@ -10,7 +10,29 @@ from urllib.parse import quote
 from urllib.request import urlopen
 
 from rpi5_agent.models import Scenario, ToolCall, ToolError, ToolResult
-from rpi5_agent.specification import HW_TEST_SPECIFICATION, LiveHwTestSpecification
+from rpi5_agent.specification import (
+    HW_TEST_SPECIFICATION,
+    LiveAideEcuSpecification,
+    LiveHwTestSpecification,
+)
+
+_AIDE_CAPTURE_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "a_fan_cmd": ("board_a", ("duty_target",)),
+    "a_thermal_status": (
+        "board_a",
+        (
+            "temp_degc",
+            "temp_valid",
+            "duty_target",
+            "vib_rms_mg",
+            "vib_valid",
+            "a_state",
+            "thermal_state",
+            "fault_flags",
+        ),
+    ),
+    "b_fan_status": ("board_b", ("fan_rpm", "duty_actual", "fan_state", "fault_code")),
+}
 
 
 class HttpHardwareProvider:
@@ -25,7 +47,7 @@ class HttpHardwareProvider:
         timeout_seconds: float = 3.0,
         can_interface: str = "can0",
         uart_target: str = "hw_test_f103",
-        specification: LiveHwTestSpecification = HW_TEST_SPECIFICATION,
+        specification: LiveHwTestSpecification | LiveAideEcuSpecification = HW_TEST_SPECIFICATION,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
@@ -39,6 +61,21 @@ class HttpHardwareProvider:
         del scenario  # Live provider reads real hardware independent of synthetic Scenario.
         with self._lock:
             self._cached_can_snapshot = None
+        if isinstance(self.specification, LiveAideEcuSpecification):
+            calls = [
+                ToolCall(tool="can.bus_state", target=self.can_interface),
+                ToolCall(tool="can.capture", target="a_fan_cmd"),
+                ToolCall(tool="can.capture", target="a_thermal_status"),
+                ToolCall(tool="can.capture", target="b_fan_status"),
+            ]
+            if self.specification.uart_target:
+                calls.append(
+                    ToolCall(
+                        tool="serial.read_can_diagnostics",
+                        target=self.specification.uart_target,
+                    )
+                )
+            return calls
         return [
             ToolCall(tool="can.bus_state", target=self.can_interface),
             ToolCall(tool="can.capture", target=self.can_interface),
@@ -73,9 +110,51 @@ class HttpHardwareProvider:
             self._cached_can_snapshot = outcome
         return outcome
 
+    def _aide_capture_config(self, target: str) -> tuple[str, str, float, tuple[str, ...]] | None:
+        if not isinstance(self.specification, LiveAideEcuSpecification):
+            return None
+        meta = _AIDE_CAPTURE_TARGETS.get(target)
+        if meta is None:
+            return None
+        origin_ecu, decoded_keys = meta
+        if target == "a_fan_cmd":
+            return (
+                self.specification.a_fan_cmd_can_id,
+                origin_ecu,
+                self.specification.a_cmd_timeout_ms,
+                decoded_keys,
+            )
+        if target == "a_thermal_status":
+            return (
+                self.specification.a_thermal_status_can_id,
+                origin_ecu,
+                self.specification.status_timeout_ms,
+                decoded_keys,
+            )
+        return (
+            self.specification.b_fan_status_can_id,
+            origin_ecu,
+            self.specification.status_timeout_ms,
+            decoded_keys,
+        )
+
     def read(self, call: ToolCall, scenario: Scenario) -> ToolResult:
         del scenario
+        is_aide = isinstance(self.specification, LiveAideEcuSpecification)
+        schema_version = self.specification.id if is_aide else None
         if call.tool in {"can.bus_state", "can.capture"}:
+            capture_cfg = (
+                self._aide_capture_config(call.target) if call.tool == "can.capture" else None
+            )
+            if is_aide and call.tool == "can.capture" and capture_cfg is None:
+                return ToolResult(
+                    tool=call.tool,
+                    target=call.target,
+                    status="unsupported",
+                    source="live_can",
+                    schema_version=schema_version,
+                    error=ToolError(code="tool_not_supported"),
+                )
             status, body = self._get_can_snapshot()
             if status != "ok" or not isinstance(body, dict):
                 err = (
@@ -86,7 +165,9 @@ class HttpHardwareProvider:
                     target=call.target,
                     status=status,  # type: ignore[arg-type]
                     source="live_can",
+                    origin_ecu=capture_cfg[1] if capture_cfg is not None else None,
                     transport="socketcan",
+                    schema_version=schema_version,
                     validity="unknown",
                     freshness="unknown",
                     error=err,
@@ -109,6 +190,7 @@ class HttpHardwareProvider:
                     source="live_uart",
                     origin_ecu=call.target,
                     transport="uart_text",
+                    schema_version=schema_version,
                     validity="unknown",
                     freshness="unknown",
                     error=err,
@@ -120,11 +202,17 @@ class HttpHardwareProvider:
             target=call.target,
             status="unsupported",
             source="live_can",
+            schema_version=schema_version,
             error=ToolError(code="tool_not_supported"),
         )
 
     def _build_bus_state_result(self, call: ToolCall, body: dict[str, Any]) -> ToolResult:
         adapter = body.get("adapter")
+        schema_version = (
+            self.specification.id
+            if isinstance(self.specification, LiveAideEcuSpecification)
+            else None
+        )
         if not isinstance(adapter, dict):
             return ToolResult(
                 tool=call.tool,
@@ -132,6 +220,7 @@ class HttpHardwareProvider:
                 status="invalid",
                 source="live_can",
                 transport="socketcan",
+                schema_version=schema_version,
                 validity="invalid",
                 freshness="unknown",
                 error=ToolError(code="collector_unreachable"),
@@ -145,6 +234,7 @@ class HttpHardwareProvider:
                 status="unavailable",
                 source="live_can",
                 transport="socketcan",
+                schema_version=schema_version,
                 validity="unknown",
                 freshness="unknown",
                 error=ToolError(code="can_interface_unavailable"),
@@ -162,6 +252,7 @@ class HttpHardwareProvider:
             status="ok",
             source="live_can",
             transport="socketcan",
+            schema_version=schema_version,
             validity="valid",
             freshness="fresh",
             data={
@@ -180,6 +271,17 @@ class HttpHardwareProvider:
         )
 
     def _build_capture_result(self, call: ToolCall, body: dict[str, Any]) -> ToolResult:
+        is_aide = isinstance(self.specification, LiveAideEcuSpecification)
+        schema_version = self.specification.id if is_aide else None
+        capture_cfg = self._aide_capture_config(call.target) if is_aide else None
+        if capture_cfg is not None:
+            can_id, origin_ecu, timeout_ms, decoded_keys = capture_cfg
+        else:
+            can_id = self.specification.telemetry_can_id  # type: ignore[union-attr]
+            origin_ecu = self.uart_target
+            timeout_ms = self.specification.telemetry_timeout_ms  # type: ignore[union-attr]
+            decoded_keys = ("magic_ok",)
+
         streams = body.get("streams")
         if not isinstance(streams, dict):
             return ToolResult(
@@ -187,12 +289,13 @@ class HttpHardwareProvider:
                 target=call.target,
                 status="invalid",
                 source="live_can",
+                origin_ecu=origin_ecu,
                 transport="socketcan",
+                schema_version=schema_version,
                 validity="invalid",
                 freshness="unknown",
                 error=ToolError(code="collector_unreachable"),
             )
-        can_id = self.specification.telemetry_can_id
         stream = streams.get(can_id)
         if not isinstance(stream, dict):
             return ToolResult(
@@ -200,8 +303,9 @@ class HttpHardwareProvider:
                 target=call.target,
                 status="ok",
                 source="live_can",
-                origin_ecu=self.uart_target,
+                origin_ecu=origin_ecu,
                 transport="socketcan",
+                schema_version=schema_version,
                 validity="unknown",
                 freshness="unknown",
                 data={
@@ -210,6 +314,7 @@ class HttpHardwareProvider:
                     "valid_frame_count_in_window": 0,
                     "invalid_frame_count_in_window": 0,
                     "sequence_gap_count": 0,
+                    "consecutive_frozen_count": 0,
                 },
             )
         decoded = stream.get("decoded")
@@ -223,33 +328,40 @@ class HttpHardwareProvider:
             stream.get("invalid_frame_count_in_window", 0 if valid_frame else frame_count)
         )
         age_ms = stream.get("age_ms")
-        is_fresh = (
-            frame_count > 0
-            and isinstance(age_ms, int | float)
-            and age_ms <= self.specification.telemetry_timeout_ms
-        )
+        is_fresh = frame_count > 0 and isinstance(age_ms, int | float) and age_ms <= timeout_ms
         freshness = "fresh" if is_fresh else ("stale" if frame_count > 0 else "unknown")
         validity = "valid" if valid_frame else "invalid"
+        data: dict[str, Any] = {
+            "can_id": can_id,
+            "dlc": stream.get("dlc"),
+            "frame_count_in_window": frame_count,
+            "valid_frame_count_in_window": valid_count,
+            "invalid_frame_count_in_window": invalid_count,
+            "age_ms": age_ms,
+            "last_alive_counter": stream.get("last_alive_counter"),
+            "sequence_gap_count": stream.get("sequence_gap_count", 0),
+            "consecutive_frozen_count": stream.get("consecutive_frozen_count", 0),
+        }
+        for key in decoded_keys:
+            data[key] = decoded_dict.get(key)
+        field_validity: dict[str, bool | None] = {}
+        if is_aide and call.target == "a_thermal_status" and valid_frame:
+            field_validity = {
+                "temp_degc": decoded_dict.get("temp_valid"),
+                "vib_rms_mg": decoded_dict.get("vib_valid"),
+            }
         return ToolResult(
             tool=call.tool,
             target=call.target,
             status="ok",
             source="live_can",
-            origin_ecu=self.uart_target,
+            origin_ecu=origin_ecu,
             transport="socketcan",
+            schema_version=schema_version,
             validity=validity,
+            field_validity=field_validity,
             freshness=freshness,
-            data={
-                "can_id": can_id,
-                "dlc": stream.get("dlc"),
-                "frame_count_in_window": frame_count,
-                "valid_frame_count_in_window": valid_count,
-                "invalid_frame_count_in_window": invalid_count,
-                "age_ms": age_ms,
-                "last_alive_counter": stream.get("last_alive_counter"),
-                "sequence_gap_count": stream.get("sequence_gap_count", 0),
-                "magic_ok": decoded_dict.get("magic_ok"),
-            },
+            data=data,
         )
 
     def _build_uart_result(self, call: ToolCall, body: dict[str, Any]) -> ToolResult:
