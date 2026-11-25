@@ -15,3 +15,18 @@ models/
 *.gguf
 *.log
 .DS_Store
+Thumbs.db
+
+# Local AI agent state, caches, and personal overrides (never commit)
+.gemini/*
+!.gemini/README.md
+!.gemini/settings.json
+.agents/*.local.*
+.agents/**/*.local.*
+.agents/.cache/
+.claude/
+CLAUDE.local.md
+AGENTS.local.md
+GEMINI.local.md
+.cursor/
+.windsurf/

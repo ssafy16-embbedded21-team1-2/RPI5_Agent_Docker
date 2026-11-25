@@ -321,6 +321,7 @@ API에는 기존 `summary`와 함께 구조화된 `explanation`, `llm_metadata`,
 ## 6. 개발과 테스트
 
 Docker 없이 Python 코드만 개발할 때는 [uv](https://docs.astral.sh/uv/)를 사용합니다.
+멀티 PC 환경·AI 코딩 에이전트 공통 컨텍스트는 [`AGENTS.md`](AGENTS.md)를 단일 기준으로 삼으며, 세부 규칙·런북은 [`.agents/`](.agents/README.md)(및 [`CLAUDE.md`](CLAUDE.md), [`.gemini/settings.json`](.gemini/settings.json))로 공유합니다.
 
 ```bash
 uv sync --frozen
