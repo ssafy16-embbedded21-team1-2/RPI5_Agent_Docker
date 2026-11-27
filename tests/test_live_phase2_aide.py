@@ -4,10 +4,11 @@ from threading import Thread
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from rpi5_agent.api import create_app
 from rpi5_agent.assessment import evaluate, evaluate_live_aide_ecu
-from rpi5_agent.config import Settings
+from rpi5_agent.config import Settings, build_live_specification
 from rpi5_agent.evidence_summary import build_model_payload
 from rpi5_agent.hw_collector import (
     CanCollectorBuffer,
@@ -18,10 +19,11 @@ from rpi5_agent.hw_collector import (
     parse_a_fan_cmd_frame,
     parse_a_thermal_status_frame,
     parse_b_fan_status_frame,
+    parse_ip_link_can_json,
 )
 from rpi5_agent.llm import RoutedSummarizer
 from rpi5_agent.models import LLMTarget
-from rpi5_agent.specification import LiveAideEcuSpecification
+from rpi5_agent.specification import LiveAideEcuSpecification, LiveHwTestSpecification
 from rpi5_agent.tools.collection import collect_evidence
 from rpi5_agent.tools.live_provider import HttpHardwareProvider
 
@@ -577,3 +579,291 @@ def create_collector_evidence_fixture(base_url: str):
     evidence = [provider.read(call, None) for call in calls]  # type: ignore[arg-type]
     evidence[2].data["secret_raw_frame"] = "MUST_BE_FILTERED"
     return evidence
+
+
+def test_shared_0x100_dlc4_hw_test_and_dlc8_board_b_cmd_isolation():
+    now = datetime.now(UTC)
+    ts = now - timedelta(milliseconds=30)
+
+    # Case 1: Both 0x100 DLC 4 (hw_test) and 0x100 DLC 8 (Board B A_FAN_CMD) on the bus.
+    buf = CanCollectorBuffer(can_id_scheme="auto")
+    buf.record_frame(0x100, b"\xa5\x5a\x00\x05", dlc=4, rx_utc=ts)
+    buf.record_frame(0x100, bytes.fromhex("3A 00 00 00 00 00 00 07"), dlc=8, rx_utc=ts)
+    buf.record_frame(0x300, bytes.fromhex("A4 01 3A 78 00 01 00 07"), dlc=8, rx_utc=ts)
+    buf.record_frame(0x340, _build_b_fan_bytes(fan_rpm=1500, duty_actual=60), dlc=8, rx_utc=ts)
+
+    server, worker, base_url = _start_test_collector(
+        buf, UartCollectorBuffer(discard_initial_partial=False)
+    )
+    try:
+        p1_provider = HttpHardwareProvider(
+            base_url=base_url, specification=LiveHwTestSpecification()
+        )
+        p1_ev = [p1_provider.read(call, None) for call in p1_provider.plan(None)]  # type: ignore[arg-type]
+        p1_codes = {item.code for item in evaluate(p1_ev, spec=p1_provider.specification)}
+        assert "CAN_TELEMETRY_FRESH" in p1_codes
+        assert p1_ev[1].data["dlc"] == 4
+        assert p1_ev[1].data["magic_ok"] is True
+
+        p2_spec = build_live_specification(
+            Settings(_env_file=None, live_specification="aide_ecu", aide_can_id_scheme="board_b")
+        )
+        p2_provider = HttpHardwareProvider(base_url=base_url, specification=p2_spec)
+        p2_ev = [p2_provider.read(call, None) for call in p2_provider.plan(None)]  # type: ignore[arg-type]
+        p2_codes = {item.code for item in evaluate(p2_ev, spec=p2_spec)}
+        assert p2_codes == {
+            "LOCAL_ADAPTER_ACTIVE",
+            "A_FAN_CMD_FRESH",
+            "A_THERMAL_STATUS_FRESH",
+            "B_FAN_STATUS_FRESH",
+        }
+        assert p2_ev[1].data["can_id"] == "0x100"
+        assert p2_ev[1].data["dlc"] == 8
+        assert p2_ev[1].data["duty_target"] == 58
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+
+    # Case 2: Only 0x100 DLC 4 present -> Phase 2 board_b must report MISSING, not INVALID.
+    buf_only_hw = CanCollectorBuffer(can_id_scheme="auto")
+    buf_only_hw.record_frame(0x100, b"\xa5\x5a\x00\x05", dlc=4, rx_utc=ts)
+    server2, worker2, base_url2 = _start_test_collector(
+        buf_only_hw, UartCollectorBuffer(discard_initial_partial=False)
+    )
+    try:
+        p2_spec = build_live_specification(
+            Settings(_env_file=None, live_specification="aide_ecu", aide_can_id_scheme="board_b")
+        )
+        p2_provider = HttpHardwareProvider(base_url=base_url2, specification=p2_spec)
+        p2_ev = [p2_provider.read(call, None) for call in p2_provider.plan(None)]  # type: ignore[arg-type]
+        p2_codes = {item.code for item in evaluate(p2_ev, spec=p2_spec)}
+        assert "A_FAN_CMD_MISSING" in p2_codes
+        assert "A_FAN_CMD_INVALID" not in p2_codes
+    finally:
+        server2.shutdown()
+        server2.server_close()
+        worker2.join(timeout=2)
+
+    # Case 3: Malformed 0x100 DLC 8 -> Phase 2 reports INVALID while Phase 1 DLC 4 stays FRESH.
+    buf_bad_dlc8 = CanCollectorBuffer(can_id_scheme="auto")
+    buf_bad_dlc8.record_frame(0x100, b"\xa5\x5a\x00\x05", dlc=4, rx_utc=ts)
+    buf_bad_dlc8.record_frame(0x100, bytes.fromhex("65 00 00 00 00 00 00 07"), dlc=8, rx_utc=ts)
+    server3, worker3, base_url3 = _start_test_collector(
+        buf_bad_dlc8, UartCollectorBuffer(discard_initial_partial=False)
+    )
+    try:
+        p1_provider = HttpHardwareProvider(
+            base_url=base_url3, specification=LiveHwTestSpecification()
+        )
+        p1_codes = {
+            item.code
+            for item in evaluate([p1_provider.read(call, None) for call in p1_provider.plan(None)])  # type: ignore[arg-type]
+        }
+        assert "CAN_TELEMETRY_FRESH" in p1_codes
+
+        p2_spec = build_live_specification(
+            Settings(_env_file=None, live_specification="aide_ecu", aide_can_id_scheme="board_b")
+        )
+        p2_provider = HttpHardwareProvider(base_url=base_url3, specification=p2_spec)
+        p2_codes = {
+            item.code
+            for item in evaluate(
+                [p2_provider.read(call, None) for call in p2_provider.plan(None)],  # type: ignore[arg-type]
+                spec=p2_spec,
+            )
+        }
+        assert "A_FAN_CMD_INVALID" in p2_codes
+    finally:
+        server3.shutdown()
+        server3.server_close()
+        worker3.join(timeout=2)
+
+
+def test_board_b_scheme_e2e_vcan_adapter_and_configurable_timeout():
+    vcan_up_json = json.dumps(
+        [
+            {
+                "ifname": "vcan0",
+                "flags": ["NOARP", "UP", "LOWER_UP"],
+                "operstate": "UNKNOWN",
+                "linkinfo": {"info_kind": "vcan"},
+                "stats64": {
+                    "rx": {"packets": 12, "errors": 0, "dropped": 0},
+                    "tx": {"packets": 0, "errors": 0, "dropped": 0},
+                },
+            }
+        ]
+    )
+    vcan_down_json = json.dumps(
+        [
+            {
+                "ifname": "vcan0",
+                "flags": ["NOARP"],
+                "operstate": "DOWN",
+                "linkinfo": {"info_kind": "vcan"},
+            }
+        ]
+    )
+    parsed_up = parse_ip_link_can_json(vcan_up_json, "vcan0")
+    assert parsed_up["operstate"] == "UP"
+    assert parsed_up["can_state"] == "ERROR-ACTIVE"
+    assert parsed_up["bitrate_bps"] is None
+    parsed_down = parse_ip_link_can_json(vcan_down_json, "vcan0")
+    assert parsed_down["can_state"] == "STOPPED"
+
+    now = datetime.now(UTC)
+    ts = now - timedelta(milliseconds=40)
+    buf = CanCollectorBuffer(can_id_scheme="board_b")
+    buf.record_frame(0x100, bytes.fromhex("3A 00 00 00 00 00 00 07"), dlc=8, rx_utc=ts)
+    buf.record_frame(0x300, bytes.fromhex("A4 01 3A 78 00 01 00 07"), dlc=8, rx_utc=ts)
+    buf.record_frame(0x340, bytes.fromhex("DC 05 3C 02 00 00 00 07"), dlc=8, rx_utc=ts)
+
+    server = create_collector_http_server(
+        "127.0.0.1",
+        0,
+        can_buffer=buf,
+        uart_buffer=UartCollectorBuffer(discard_initial_partial=False),
+        can_interface="vcan0",
+        adapter_reader=lambda _iface: parsed_up,
+        port_probe=lambda: False,
+    )
+    worker = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    worker.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        settings = Settings(
+            _env_file=None,
+            evidence_provider="http_collector",
+            live_specification="aide_ecu",
+            aide_can_id_scheme="board_b",
+            collector_can_interface="vcan0",
+            collector_base_url=base_url,
+            llm_enabled=False,
+        )
+        with TestClient(create_app(settings)) as client:
+            diag = client.post("/diagnose", json={}).json()
+            assert {item["code"] for item in diag["findings"]} == {
+                "LOCAL_ADAPTER_ACTIVE",
+                "A_FAN_CMD_FRESH",
+                "A_THERMAL_STATUS_FRESH",
+                "B_FAN_STATUS_FRESH",
+            }
+            assert all(item["severity"] == "info" for item in diag["findings"])
+            captured_ids = [
+                item["data"]["can_id"] for item in diag["evidence"] if item["tool"] == "can.capture"
+            ]
+            assert captured_ids == ["0x100", "0x300", "0x340"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+
+    # Verify A_FAN_CMD 380 ms age: STALE at 300 ms (pjt20) vs FRESH at 500 ms (board_b).
+    age_now = datetime.now(UTC)
+    age_400_buf = CanCollectorBuffer(can_id_scheme="auto")
+    ts_380 = age_now - timedelta(milliseconds=380)
+    ts_fresh = age_now - timedelta(milliseconds=20)
+    age_400_buf.record_frame(0x080, bytes.fromhex("3A 00 00 00 00 00 00 07"), dlc=8, rx_utc=ts_380)
+    age_400_buf.record_frame(
+        0x180, bytes.fromhex("A4 01 3A 78 00 01 00 07"), dlc=8, rx_utc=ts_fresh
+    )
+    age_400_buf.record_frame(0x1C0, _build_b_fan_bytes(), dlc=8, rx_utc=ts_fresh)
+    age_400_buf.record_frame(0x100, bytes.fromhex("3A 00 00 00 00 00 00 07"), dlc=8, rx_utc=ts_380)
+    age_400_buf.record_frame(
+        0x300, bytes.fromhex("A4 01 3A 78 00 01 00 07"), dlc=8, rx_utc=ts_fresh
+    )
+    age_400_buf.record_frame(0x340, _build_b_fan_bytes(), dlc=8, rx_utc=ts_fresh)
+
+    srv_t, wrk_t, url_t = _start_test_collector(
+        age_400_buf, UartCollectorBuffer(discard_initial_partial=False)
+    )
+    try:
+        spec_pjt20 = build_live_specification(
+            Settings(_env_file=None, live_specification="aide_ecu", aide_can_id_scheme="pjt20")
+        )
+        prov_pjt20 = HttpHardwareProvider(base_url=url_t, specification=spec_pjt20)
+        codes_pjt20 = {
+            item.code
+            for item in evaluate(
+                [prov_pjt20.read(c, None) for c in prov_pjt20.plan(None)],  # type: ignore[arg-type]
+                spec=spec_pjt20,
+            )
+        }
+        assert "A_FAN_CMD_STALE" in codes_pjt20
+
+        spec_board_b = build_live_specification(
+            Settings(_env_file=None, live_specification="aide_ecu", aide_can_id_scheme="board_b")
+        )
+        prov_board_b = HttpHardwareProvider(base_url=url_t, specification=spec_board_b)
+        codes_board_b = {
+            item.code
+            for item in evaluate(
+                [prov_board_b.read(c, None) for c in prov_board_b.plan(None)],  # type: ignore[arg-type]
+                spec=spec_board_b,
+            )
+        }
+        assert "A_FAN_CMD_FRESH" in codes_board_b
+
+        spec_override = build_live_specification(
+            Settings(
+                _env_file=None,
+                live_specification="aide_ecu",
+                aide_can_id_scheme="board_b",
+                aide_a_cmd_timeout_ms=300,
+            )
+        )
+        prov_override = HttpHardwareProvider(base_url=url_t, specification=spec_override)
+        codes_override = {
+            item.code
+            for item in evaluate(
+                [prov_override.read(c, None) for c in prov_override.plan(None)],  # type: ignore[arg-type]
+                spec=spec_override,
+            )
+        }
+        assert "A_FAN_CMD_STALE" in codes_override
+    finally:
+        srv_t.shutdown()
+        srv_t.server_close()
+        wrk_t.join(timeout=2)
+
+
+def test_aide_config_blank_overrides_custom_normalization_and_validation():
+    blank_settings = Settings(
+        _env_file=None,
+        live_specification="aide_ecu",
+        aide_a_fan_cmd_can_id="",
+        aide_a_thermal_status_can_id="  ",
+        aide_b_fan_status_can_id="",
+        aide_a_cmd_timeout_ms="",  # type: ignore[arg-type]
+        aide_status_timeout_ms="",  # type: ignore[arg-type]
+    )
+    assert blank_settings.aide_a_fan_cmd_can_id is None
+    assert blank_settings.aide_a_cmd_timeout_ms is None
+    default_spec = build_live_specification(blank_settings)
+    assert isinstance(default_spec, LiveAideEcuSpecification)
+    assert default_spec.can_id_scheme == "pjt20"
+    assert default_spec.a_fan_cmd_can_id == "0x080"
+
+    custom_spec = build_live_specification(
+        Settings(
+            _env_file=None,
+            live_specification="aide_ecu",
+            aide_can_id_scheme="pjt20",
+            aide_a_fan_cmd_can_id="0x11a",
+        )
+    )
+    assert isinstance(custom_spec, LiveAideEcuSpecification)
+    assert custom_spec.can_id_scheme == "custom"
+    assert custom_spec.a_fan_cmd_can_id == "0x11A"
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, aide_a_fan_cmd_can_id="0x800")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, aide_a_fan_cmd_can_id="not-hex")
+    with pytest.raises(ValidationError):
+        LiveAideEcuSpecification(
+            a_fan_cmd_can_id="0x100",
+            a_thermal_status_can_id="0x100",
+            b_fan_status_can_id="0x340",
+        )

@@ -5,8 +5,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from rpi5_agent.models import DiagnosticProfile
 from rpi5_agent.specification import (
+    AIDE_CAN_ID_SCHEMES,
+    AideCanIdScheme,
     LiveAideEcuSpecification,
     LiveHwTestSpecification,
+    normalize_standard_can_id,
 )
 
 
@@ -16,6 +19,12 @@ class Settings(BaseSettings):
     diagnostic_profile: DiagnosticProfile = DiagnosticProfile.PRODUCT
     evidence_provider: Literal["fixture", "http_collector"] = "fixture"
     live_specification: Literal["hw_test_f103", "aide_ecu"] = "hw_test_f103"
+    aide_can_id_scheme: Literal["pjt20", "board_b"] = "pjt20"
+    aide_a_fan_cmd_can_id: str | None = None
+    aide_a_thermal_status_can_id: str | None = None
+    aide_b_fan_status_can_id: str | None = None
+    aide_a_cmd_timeout_ms: float | None = Field(default=None, gt=0, le=60000)
+    aide_status_timeout_ms: float | None = Field(default=None, gt=0, le=60000)
     aide_b_fault_encoding: Literal["code", "bitmask"] = "code"
     aide_include_uart: bool = False
     collector_base_url: str = "http://127.0.0.1:8090"
@@ -40,6 +49,31 @@ class Settings(BaseSettings):
     external_llm_response_format: Literal["prompt", "json_object", "json_schema"] = "prompt"
     external_llm_fallback_on_local_failure: bool = True
     auto_prefer_external_for_warnings: bool = True
+
+    @field_validator(
+        "aide_a_fan_cmd_can_id",
+        "aide_a_thermal_status_can_id",
+        "aide_b_fan_status_can_id",
+        "aide_a_cmd_timeout_ms",
+        "aide_status_timeout_ms",
+        mode="before",
+    )
+    @classmethod
+    def blank_optional_aide_setting_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "aide_a_fan_cmd_can_id",
+        "aide_a_thermal_status_can_id",
+        "aide_b_fan_status_can_id",
+    )
+    @classmethod
+    def validate_aide_can_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_standard_can_id(value)
 
     @field_validator("llm_base_url", "external_llm_base_url", "collector_base_url")
     @classmethod
@@ -91,8 +125,39 @@ def build_live_specification(
 ) -> LiveHwTestSpecification | LiveAideEcuSpecification:
     """Build the configured Phase 1 or Phase 2 live assessment specification."""
     if settings.live_specification == "aide_ecu":
+        preset = AIDE_CAN_ID_SCHEMES[settings.aide_can_id_scheme]
+        a_cmd_id = settings.aide_a_fan_cmd_can_id or str(preset["a_fan_cmd_can_id"])
+        a_thermal_id = settings.aide_a_thermal_status_can_id or str(
+            preset["a_thermal_status_can_id"]
+        )
+        b_fan_id = settings.aide_b_fan_status_can_id or str(preset["b_fan_status_can_id"])
+        a_cmd_timeout_ms = (
+            settings.aide_a_cmd_timeout_ms
+            if settings.aide_a_cmd_timeout_ms is not None
+            else float(preset["a_cmd_timeout_ms"])
+        )
+        status_timeout_ms = (
+            settings.aide_status_timeout_ms
+            if settings.aide_status_timeout_ms is not None
+            else 500.0
+        )
+        effective_scheme: AideCanIdScheme = (
+            "custom"
+            if (
+                a_cmd_id != preset["a_fan_cmd_can_id"]
+                or a_thermal_id != preset["a_thermal_status_can_id"]
+                or b_fan_id != preset["b_fan_status_can_id"]
+            )
+            else settings.aide_can_id_scheme
+        )
         return LiveAideEcuSpecification(
+            can_id_scheme=effective_scheme,
             can_interface=settings.collector_can_interface,
+            a_fan_cmd_can_id=a_cmd_id,
+            a_thermal_status_can_id=a_thermal_id,
+            b_fan_status_can_id=b_fan_id,
+            a_cmd_timeout_ms=a_cmd_timeout_ms,
+            status_timeout_ms=status_timeout_ms,
             b_fault_encoding=settings.aide_b_fault_encoding,
             uart_target=settings.collector_uart_target if settings.aide_include_uart else None,
         )

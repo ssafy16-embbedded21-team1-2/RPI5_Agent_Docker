@@ -11,9 +11,10 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlsplit
 
 DEFAULT_UART_DEVICE_BY_ID = (
@@ -25,6 +26,9 @@ HW_TEST_MAGIC = b"\xa5\x5a\x00"
 A_FAN_CMD_CAN_ID = 0x080
 A_THERMAL_STATUS_CAN_ID = 0x180
 B_FAN_STATUS_CAN_ID = 0x1C0
+BOARD_B_A_FAN_CMD_CAN_ID = 0x100
+BOARD_B_A_THERMAL_STATUS_CAN_ID = 0x300
+BOARD_B_FAN_STATUS_CAN_ID = 0x340
 TEMP_AMBIENT_INVALID_RAW = 0x7FFF
 VIB_RMS_INVALID_RAW = 0xFFFF
 
@@ -224,11 +228,105 @@ class CanCollectorBuffer:
         *,
         max_events: int = 5000,
         codecs: dict[int, Callable[..., dict[str, Any]]] | None = None,
+        can_id_scheme: Literal["auto", "pjt20", "board_b"] = "auto",
+        a_fan_cmd_id: int | None = None,
+        a_thermal_status_id: int | None = None,
+        b_fan_status_id: int | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._max_events = max_events
-        self._codecs = dict(DEFAULT_CAN_CODECS if codecs is None else codecs)
-        self._streams: dict[int, _CanStreamState] = {}
+        self.can_id_scheme = can_id_scheme
+        self._custom_codecs = dict(codecs) if codecs is not None else None
+        self._id_routes, self._dlc8_shared_route = self._build_routes(
+            can_id_scheme,
+            a_fan_cmd_id=a_fan_cmd_id,
+            a_thermal_status_id=a_thermal_status_id,
+            b_fan_status_id=b_fan_status_id,
+        )
+        self._streams: dict[str, _CanStreamState] = {}
+
+    @staticmethod
+    def _build_routes(
+        can_id_scheme: Literal["auto", "pjt20", "board_b"],
+        *,
+        a_fan_cmd_id: int | None,
+        a_thermal_status_id: int | None,
+        b_fan_status_id: int | None,
+    ) -> tuple[
+        dict[int, tuple[str, Callable[..., dict[str, Any]]]],
+        tuple[str, Callable[..., dict[str, Any]]] | None,
+    ]:
+        routes: dict[int, tuple[str, Callable[..., dict[str, Any]]]] = {}
+        dlc8_shared: tuple[str, Callable[..., dict[str, Any]]] | None = None
+
+        if can_id_scheme == "auto":
+            routes[HW_TEST_CAN_ID] = (format_can_id(HW_TEST_CAN_ID), parse_hw_test_can_frame)
+            for cid, parser in (
+                (A_FAN_CMD_CAN_ID, parse_a_fan_cmd_frame),
+                (A_THERMAL_STATUS_CAN_ID, parse_a_thermal_status_frame),
+                (B_FAN_STATUS_CAN_ID, parse_b_fan_status_frame),
+                (BOARD_B_A_THERMAL_STATUS_CAN_ID, parse_a_thermal_status_frame),
+                (BOARD_B_FAN_STATUS_CAN_ID, parse_b_fan_status_frame),
+            ):
+                routes[cid] = (format_can_id(cid), partial(parser, expected_can_id=cid))
+            dlc8_shared = (
+                f"{format_can_id(HW_TEST_CAN_ID)}:dlc8",
+                partial(parse_a_fan_cmd_frame, expected_can_id=HW_TEST_CAN_ID),
+            )
+        elif can_id_scheme == "pjt20":
+            routes[HW_TEST_CAN_ID] = (format_can_id(HW_TEST_CAN_ID), parse_hw_test_can_frame)
+            for cid, parser in (
+                (A_FAN_CMD_CAN_ID, parse_a_fan_cmd_frame),
+                (A_THERMAL_STATUS_CAN_ID, parse_a_thermal_status_frame),
+                (B_FAN_STATUS_CAN_ID, parse_b_fan_status_frame),
+            ):
+                routes[cid] = (format_can_id(cid), partial(parser, expected_can_id=cid))
+        else:  # board_b
+            routes[BOARD_B_A_FAN_CMD_CAN_ID] = (
+                f"{format_can_id(BOARD_B_A_FAN_CMD_CAN_ID)}:dlc8",
+                partial(parse_a_fan_cmd_frame, expected_can_id=BOARD_B_A_FAN_CMD_CAN_ID),
+            )
+            routes[BOARD_B_A_THERMAL_STATUS_CAN_ID] = (
+                format_can_id(BOARD_B_A_THERMAL_STATUS_CAN_ID),
+                partial(
+                    parse_a_thermal_status_frame, expected_can_id=BOARD_B_A_THERMAL_STATUS_CAN_ID
+                ),
+            )
+            routes[BOARD_B_FAN_STATUS_CAN_ID] = (
+                format_can_id(BOARD_B_FAN_STATUS_CAN_ID),
+                partial(parse_b_fan_status_frame, expected_can_id=BOARD_B_FAN_STATUS_CAN_ID),
+            )
+
+        for cid, parser in (
+            (a_fan_cmd_id, parse_a_fan_cmd_frame),
+            (a_thermal_status_id, parse_a_thermal_status_frame),
+            (b_fan_status_id, parse_b_fan_status_frame),
+        ):
+            if cid is None:
+                continue
+            bound = partial(parser, expected_can_id=cid)
+            if cid == HW_TEST_CAN_ID:
+                if can_id_scheme == "auto":
+                    dlc8_shared = (f"{format_can_id(cid)}:dlc8", bound)
+                elif can_id_scheme == "board_b":
+                    routes[cid] = (f"{format_can_id(cid)}:dlc8", bound)
+                else:
+                    routes[cid] = (format_can_id(cid), bound)
+            else:
+                routes[cid] = (format_can_id(cid), bound)
+        return routes, dlc8_shared
+
+    def _resolve_route(
+        self, can_id: int, actual_dlc: int
+    ) -> tuple[str, Callable[..., dict[str, Any]]] | None:
+        if self._custom_codecs is not None:
+            codec = self._custom_codecs.get(can_id)
+            if codec is None:
+                return None
+            return (format_can_id(can_id), codec)
+        if can_id == HW_TEST_CAN_ID and actual_dlc == 8 and self._dlc8_shared_route is not None:
+            return self._dlc8_shared_route
+        return self._id_routes.get(can_id)
 
     def record_frame(
         self,
@@ -239,16 +337,17 @@ class CanCollectorBuffer:
         rx_utc: datetime | None = None,
     ) -> dict[str, Any]:
         ts = rx_utc if rx_utc is not None else datetime.now(UTC)
-        codec = self._codecs.get(can_id)
-        if codec is None:
-            actual_dlc = dlc if dlc is not None else len(bytes(data))
+        actual_dlc = dlc if dlc is not None else len(bytes(data))
+        route = self._resolve_route(can_id, actual_dlc)
+        if route is None:
             return {"valid": False, "alive_counter": None, "dlc": actual_dlc}
+        stream_key, codec = route
         parsed = codec(can_id, data, dlc=dlc)
         with self._lock:
-            stream = self._streams.get(can_id)
+            stream = self._streams.get(stream_key)
             if stream is None:
                 stream = _CanStreamState(self._max_events)
-                self._streams[can_id] = stream
+                self._streams[stream_key] = stream
             gap = 0
             if parsed["valid"] and parsed.get("alive_counter") is not None:
                 counter = int(parsed["alive_counter"])
@@ -284,13 +383,12 @@ class CanCollectorBuffer:
         ref_now = now if now is not None else datetime.now(UTC)
         with self._lock:
             stream_items = [
-                (can_id, list(stream.events), stream.last_event)
-                for can_id, stream in self._streams.items()
+                (stream_key, list(stream.events), stream.last_event)
+                for stream_key, stream in self._streams.items()
             ]
 
         streams: dict[str, Any] = {}
-        for can_id, events, last_event in stream_items:
-            id_key = format_can_id(can_id)
+        for stream_key, events, last_event in stream_items:
             in_window = [
                 ev for ev in events if (ref_now - ev.rx_utc).total_seconds() * 1000.0 <= window_ms
             ]
@@ -299,7 +397,7 @@ class CanCollectorBuffer:
                 age_ms = max(0.0, (ref_now - latest.rx_utc).total_seconds() * 1000.0)
                 valid_count = sum(1 for ev in in_window if ev.valid)
                 invalid_count = len(in_window) - valid_count
-                streams[id_key] = {
+                streams[stream_key] = {
                     "dlc": latest.dlc,
                     "frame_count_in_window": len(in_window),
                     "valid_frame_count_in_window": valid_count,
@@ -313,7 +411,7 @@ class CanCollectorBuffer:
                 }
             elif last_event is not None:
                 age_ms = max(0.0, (ref_now - last_event.rx_utc).total_seconds() * 1000.0)
-                streams[id_key] = {
+                streams[stream_key] = {
                     "dlc": last_event.dlc,
                     "frame_count_in_window": 0,
                     "valid_frame_count_in_window": 0,
@@ -507,6 +605,7 @@ def parse_ip_link_can_json(raw_json: str, interface: str = "can0") -> dict[str, 
         raise ValueError("Invalid ip link entry")
     flags = entry.get("flags") or []
     linkinfo = entry.get("linkinfo") or {}
+    info_kind = str(linkinfo.get("info_kind") or "")
     info_data = linkinfo.get("info_data") or {}
     info_xstats = linkinfo.get("info_xstats") or {}
     bittiming = info_data.get("bittiming") or {}
@@ -514,7 +613,11 @@ def parse_ip_link_can_json(raw_json: str, interface: str = "can0") -> dict[str, 
     rx_stats = stats64.get("rx") or {}
     tx_stats = stats64.get("tx") or {}
 
-    can_state = str(info_data.get("state") or "UNKNOWN")
+    raw_can_state = info_data.get("state")
+    if not raw_can_state and info_kind == "vcan":
+        can_state = "ERROR-ACTIVE" if "UP" in flags else "STOPPED"
+    else:
+        can_state = str(raw_can_state or "UNKNOWN")
     raw_operstate = str(entry.get("operstate") or "UNKNOWN")
     is_up = raw_operstate == "UP" or ("UP" in flags and can_state != "STOPPED")
     operstate = "UP" if is_up else raw_operstate
@@ -590,6 +693,7 @@ def create_collector_http_server(
                         "can_interface": can_interface,
                         "can_present": can_present,
                         "can_state": adapter.get("can_state") if adapter else None,
+                        "can_id_scheme": getattr(can_buffer, "can_id_scheme", "auto"),
                         "uart_target": uart_target,
                         "uart_device_by_id": uart_device_path,
                         "uart_port_present": check_port(),

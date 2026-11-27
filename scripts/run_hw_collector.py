@@ -101,16 +101,37 @@ def _uart_reader_loop(
                     pass
 
 
+def _parse_standard_can_id(raw: str) -> int:
+    try:
+        parsed = int(raw, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Invalid CAN ID: {raw}") from exc
+    if not 0 <= parsed <= 0x7FF:
+        raise argparse.ArgumentTypeError(
+            f"CAN ID out of 11-bit standard range (0x000..0x7FF): {raw}"
+        )
+    return parsed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
     parser.add_argument("--can-interface", default="can0")
+    parser.add_argument("--can-id-scheme", choices=("auto", "pjt20", "board_b"), default="auto")
+    parser.add_argument("--a-fan-cmd-id", type=_parse_standard_can_id, default=None)
+    parser.add_argument("--a-thermal-status-id", type=_parse_standard_can_id, default=None)
+    parser.add_argument("--b-fan-status-id", type=_parse_standard_can_id, default=None)
     parser.add_argument("--uart-target", default="hw_test_f103")
     parser.add_argument("--uart-device", default=DEFAULT_UART_DEVICE_BY_ID)
     args = parser.parse_args()
 
-    can_buffer = CanCollectorBuffer()
+    can_buffer = CanCollectorBuffer(
+        can_id_scheme=args.can_id_scheme,
+        a_fan_cmd_id=args.a_fan_cmd_id,
+        a_thermal_status_id=args.a_thermal_status_id,
+        b_fan_status_id=args.b_fan_status_id,
+    )
     uart_buffer = UartCollectorBuffer()
     stop_event = threading.Event()
 

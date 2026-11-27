@@ -2,7 +2,46 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def normalize_standard_can_id(value: str | int) -> str:
+    """Validate and normalize an 11-bit standard CAN ID (0x000..0x7FF) to 3-digit hex."""
+    if isinstance(value, bool):
+        raise ValueError("CAN ID must be an integer or 0x-prefixed hex string")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned.lower().startswith("0x") or len(cleaned) <= 2:
+            raise ValueError("CAN ID string must start with 0x (e.g. 0x100)")
+        try:
+            parsed = int(cleaned, 16)
+        except ValueError as exc:
+            raise ValueError("CAN ID string must be valid hexadecimal") from exc
+    else:
+        raise ValueError("CAN ID must be an integer or 0x-prefixed hex string")
+    if not 0 <= parsed <= 0x7FF:
+        raise ValueError("Standard CAN ID must be between 0x000 and 0x7FF")
+    return f"0x{parsed:03X}"
+
+
+AideCanIdScheme = Literal["pjt20", "board_b", "custom"]
+
+AIDE_CAN_ID_SCHEMES: dict[Literal["pjt20", "board_b"], dict[str, str | float]] = {
+    "pjt20": {
+        "a_fan_cmd_can_id": "0x080",
+        "a_thermal_status_can_id": "0x180",
+        "b_fan_status_can_id": "0x1C0",
+        "a_cmd_timeout_ms": 300.0,
+    },
+    "board_b": {
+        "a_fan_cmd_can_id": "0x100",
+        "a_thermal_status_can_id": "0x300",
+        "b_fan_status_can_id": "0x340",
+        "a_cmd_timeout_ms": 500.0,
+    },
+}
 
 
 class AssessmentSpecification(BaseModel):
@@ -51,6 +90,7 @@ class LiveAideEcuSpecification(BaseModel):
 
     id: str = "aide-ecu-v1"
     scope: Literal["live_aide_ecu"] = "live_aide_ecu"
+    can_id_scheme: AideCanIdScheme = "pjt20"
     can_interface: str = "can0"
     expected_bitrate_bps: int = 500000
     a_fan_cmd_can_id: str = "0x080"
@@ -65,6 +105,20 @@ class LiveAideEcuSpecification(BaseModel):
     uart_target: str | None = None
     uart_timeout_ms: float = Field(default=2500, gt=0, allow_inf_nan=False)
     timeout_boundary: Literal["age_gt_timeout"] = "age_gt_timeout"
+
+    @field_validator("a_fan_cmd_can_id", "a_thermal_status_can_id", "b_fan_status_can_id")
+    @classmethod
+    def validate_periodic_can_id(cls, value: str) -> str:
+        return normalize_standard_can_id(value)
+
+    @model_validator(mode="after")
+    def validate_distinct_can_ids(self) -> "LiveAideEcuSpecification":
+        ids = {self.a_fan_cmd_can_id, self.a_thermal_status_can_id, self.b_fan_status_can_id}
+        if len(ids) != 3:
+            raise ValueError(
+                "A_FAN_CMD, A_THERMAL_STATUS, and B_FAN_STATUS CAN IDs must be distinct"
+            )
+        return self
 
 
 AIDE_ECU_SPECIFICATION = LiveAideEcuSpecification()

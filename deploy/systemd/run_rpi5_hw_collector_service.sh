@@ -6,6 +6,7 @@ python_bin="${RPI5_COLLECTOR_PYTHON:-/usr/bin/python3}"
 collector_script="${repo_dir}/scripts/run_hw_collector.py"
 collector_port="${COLLECTOR_PORT:-8090}"
 can_interface="${CAN_INTERFACE:-can0}"
+can_id_scheme="${CAN_ID_SCHEME:-auto}"
 uart_target="${UART_TARGET:-hw_test_f103}"
 
 if [[ ! -r "$collector_script" || ! -x "$python_bin" ]]; then
@@ -20,10 +21,11 @@ if [[ ! "$docker_gateway" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     exit 1
 fi
 
-echo "Hardware collector listening on ${docker_gateway}:${collector_port} (can=${can_interface}, uart_target=${uart_target})"
+echo "Hardware collector listening on ${docker_gateway}:${collector_port} (can=${can_interface}, scheme=${can_id_scheme}, uart_target=${uart_target})"
 exec "$python_bin" "$collector_script" \
     --bind "$docker_gateway" \
     --port "$collector_port" \
     --can-interface "$can_interface" \
+    --can-id-scheme "$can_id_scheme" \
     --uart-target "$uart_target"
 

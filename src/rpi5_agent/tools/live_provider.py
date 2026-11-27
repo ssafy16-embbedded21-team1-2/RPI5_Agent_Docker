@@ -296,7 +296,17 @@ class HttpHardwareProvider:
                 freshness="unknown",
                 error=ToolError(code="collector_unreachable"),
             )
-        stream = streams.get(can_id)
+        if is_aide:
+            dlc_key = f"{can_id}:dlc{self.specification.periodic_dlc}"
+            stream = streams.get(dlc_key)
+            if stream is None:
+                candidate = streams.get(can_id)
+                if isinstance(candidate, dict) and "magic_ok" not in (
+                    candidate.get("decoded") or {}
+                ):
+                    stream = candidate
+        else:
+            stream = streams.get(can_id)
         if not isinstance(stream, dict):
             return ToolResult(
                 tool=call.tool,
